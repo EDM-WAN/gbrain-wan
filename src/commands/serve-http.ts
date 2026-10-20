@@ -32,6 +32,7 @@ import { mountOAuth, mountOAuthConsent, mountOwnerLoginLinks } from './serve-htt
 import { createRequireAdmin, mountAdminApi, mountAdminLogin } from './serve-http-admin-api.ts';
 import { mountSpa } from './serve-http-spa.ts';
 import { mountMcp } from './serve-http-mcp.ts';
+import { mountThinkStream } from './serve-http-think-stream.ts';
 import { createWebhookLimiters, mountWebhooks } from './serve-http-webhooks.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, type Operation } from '../core/operations.ts';
@@ -832,6 +833,7 @@ export async function buildServeHttpApp(app: express.Express, engine: BrainEngin
   mountMetrics(app, ctx);
   mountAdminApi(app, ctx);
   await mountSpa(app, ctx);
+  mountThinkStream(app, { engine, resourceVerifier, resourceMetadataUrl });
   mountMcp(app, ctx);
   mountWebhooks(app, ctx);
 

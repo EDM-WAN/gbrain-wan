@@ -33,13 +33,11 @@ afterAll(async () => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test('queued import rejects malformed frontmatter, preserves progress, and succeeds after repair', () => isolated(async () => {
-  writeFileSync(join(root, 'valid.md'), '---\ntype: note\ntitle: Valid fixture\n---\n\nA valid fixture body.\n');
-  writeFileSync(join(root, 'rejected.md'), '---\ntitle: [\n---\n\nA rejected fixture body.\n');
-  const job: MinionJobContext = {
-    id: 1,
+function makeJob(id: number, data: Record<string, unknown>): MinionJobContext {
+  return {
+    id,
     name: 'import',
-    data: { dir: root, sourceId: 'default', noEmbed: true },
+    data,
     attempts_made: 0,
     signal: new AbortController().signal,
     deadlineAtMs: null,
@@ -50,15 +48,44 @@ test('queued import rejects malformed frontmatter, preserves progress, and succe
     isActive: async () => true,
     readInbox: async () => [],
   };
+}
 
-  await expect(handler(job)).rejects.toThrow('Import failed for 1 file(s); fix rejected documents and retry the job.');
+test('queued import tolerates a few rejected files but still imports the good ones', () => isolated(async () => {
+  writeFileSync(join(root, 'valid.md'), '---\ntype: note\ntitle: Valid fixture\n---\n\nA valid fixture body.\n');
+  writeFileSync(join(root, 'rejected.md'), '---\ntitle: [\n---\n\nA rejected fixture body.\n');
+  const job = makeJob(1, { dir: root, sourceId: 'default', noEmbed: true });
+
+  // 少量被拒文件落在容忍额度内 → 任务成功，而不是把整次导入判死。
+  // （否则 source-scheduler 每轮 +1 consecutiveFailures，累计到上限会
+  //   自动停用该 source 的定时同步。）
+  await expect(handler(job)).resolves.toEqual({ imported: true });
   expect(await engine.getPage('valid', { sourceId: 'default' })).not.toBeNull();
   expect(await engine.getPage('rejected', { sourceId: 'default' })).toBeNull();
+
+  // 检查点仍记录成功的路径、排除失败的，重试才会只重跑失败项。
   const checkpoint = JSON.parse(readFileSync(join(home, '.gbrain', 'import-checkpoint.json'), 'utf8'));
   expect(checkpoint.completedPaths).toContain('valid.md');
   expect(checkpoint.completedPaths).not.toContain('rejected.md');
+}));
 
-  writeFileSync(join(root, 'rejected.md'), '---\ntype: note\ntitle: Repaired fixture\n---\n\nA repaired fixture body.\n');
+test('queued import still hard-fails when rejections exceed the tolerance', () => isolated(async () => {
+  const badDir = join(home, 'too-many-bad');
+  mkdirSync(badDir, { recursive: true });
+  writeFileSync(join(badDir, 'ok.md'), '---\ntype: note\ntitle: Ok\n---\n\nBody.\n');
+  // 超过容忍额度（5）的坏文件 → 仍是硬失败，避免把「大面积解析不了」
+  // 误当成正常。
+  for (let i = 0; i < 6; i += 1) {
+    writeFileSync(join(badDir, `bad-${i}.md`), '---\ntitle: [\n---\n\nBad body.\n');
+  }
+  const job = makeJob(2, { dir: badDir, sourceId: 'default', noEmbed: true });
+  await expect(handler(job)).rejects.toThrow(/Import failed for 6 file\(s\)/);
+}));
+
+test('repaired file imports cleanly on a fresh run', () => isolated(async () => {
+  const repairDir = join(home, 'repair');
+  mkdirSync(repairDir, { recursive: true });
+  writeFileSync(join(repairDir, 'repaired.md'), '---\ntype: note\ntitle: Repaired fixture\n---\n\nA repaired fixture body.\n');
+  const job = makeJob(3, { dir: repairDir, sourceId: 'default', noEmbed: true });
   await expect(handler(job)).resolves.toEqual({ imported: true });
-  expect(await engine.getPage('rejected', { sourceId: 'default' })).not.toBeNull();
+  expect(await engine.getPage('repaired', { sourceId: 'default' })).not.toBeNull();
 }));

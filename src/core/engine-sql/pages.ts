@@ -393,9 +393,17 @@ export async function updatePageContextualRetrievalState(
     `);
   }
 
-export async function listPages(exec: ScopedRead, filters?: PageFilters): Promise<Page[]> {
-    const limit = filters?.limit || 100;
-    const offset = filters?.offset || 0;
+/**
+ * The single WHERE construction shared by `listPages` and `listPagesCount`
+ * (v0.51.x — `list_pages include_total`). Returns the `tagJoin` (needed
+ * separately because it widens the FROM) plus the composed `where` chain,
+ * which callers splice as `WHERE 1=1 ${where}`. Kept in one place so a
+ * listing and its total can never disagree about which pages match.
+ */
+function buildListPagesConditions(filters?: PageFilters): {
+  tagJoin: ReturnType<typeof sqlFragment>;
+  where: ReturnType<typeof sqlFragment>;
+} {
     const updatedAfter = filters?.updated_after;
 
     const typeCondition = filters?.type ? sqlFragment`AND p.type = ${filters.type}` : sqlFragment``;
@@ -448,22 +456,63 @@ export async function listPages(exec: ScopedRead, filters?: PageFilters): Promis
       ? sqlFragment`AND p.effective_date <= ${filters.effective_before}::timestamptz`
       : sqlFragment``;
 
+    const where = sqlFragment`${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}`;
+    return { tagJoin, where };
+}
+
+export async function listPages(exec: ScopedRead, filters?: PageFilters): Promise<Page[]> {
+    const limit = filters?.limit || 100;
+    const offset = filters?.offset || 0;
+
+    const { tagJoin, where } = buildListPagesConditions(filters);
+
     // v0.29: ORDER BY threading via PAGE_SORT_SQL whitelist (no SQL injection).
     const sortKey = filters?.sort && PAGE_SORT_SQL[filters.sort] ? filters.sort : 'updated_desc';
     const orderBy = trustedSql(PAGE_SORT_SQL[sortKey]);
 
+    // v0.51.x — tag projection, opt-in per list_pages(include_tags). One
+    // correlated subquery for the whole page window, so a consumer renders
+    // tag chips without one get_page per row. Splices into BOTH column
+    // branches: list_pages always passes listColumnsOnly, which names its
+    // columns explicitly and would otherwise drop the projection on the floor.
+    const tagProjection = filters?.includeTags === true
+      ? sqlFragment`, COALESCE((SELECT array_agg(pt.tag ORDER BY pt.tag) FROM tags pt WHERE pt.page_id = p.id), ARRAY[]::text[]) AS tags`
+      : sqlFragment``;
+
     const columns = filters?.listColumnsOnly === true
       ? sqlFragment`p.id, p.source_id, p.slug, p.type, p.page_kind, p.title, p.created_at, p.updated_at, p.deleted_at,
-          p.effective_date, p.effective_date_source, ''::text AS compiled_truth, ''::text AS timeline, '{}'::jsonb AS frontmatter`
-      : sqlFragment`p.*`;
+          p.effective_date, p.effective_date_source, ''::text AS compiled_truth, ''::text AS timeline, '{}'::jsonb AS frontmatter${tagProjection}`
+      : sqlFragment`p.*${tagProjection}`;
       const { rows } = await exec.run(sqlFragment`
         SELECT ${columns}, to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages p
         ${tagJoin}
-        WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${slugAfterCondition} ${sourceCondition} ${deletedCondition} ${privateCondition} ${effectiveAfterCondition} ${effectiveBeforeCondition}
+        WHERE 1=1 ${where}
         ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
       `);
       return rows.map(rowToPage);
   }
+
+/**
+ * v0.51.x — page count matching the SAME predicates as `listPages`.
+ * `list_pages(include_total=true)` uses this so a paginated consumer (the web
+ * Memory Library) learns the full total from one COUNT instead of probing
+ * page-by-page. Both statements are built by `listPages`' shared condition
+ * chain, so list/count can never drift.
+ *
+ * `COUNT(DISTINCT p.id)`: the optional tag filter JOINs `tags`, which fans out
+ * one row per matching tag — a plain COUNT would inflate `--tag X` totals.
+ * `filters.limit`/`offset`/`sort` are deliberately ignored.
+ */
+export async function listPagesCount(exec: ScopedRead, filters?: PageFilters): Promise<number> {
+  const { where } = buildListPagesConditions(filters);
+  const tagJoin = filters?.tag ? sqlFragment`JOIN tags t ON t.page_id = p.id` : sqlFragment``;
+  const { rows } = await exec.run<{ total: string | number }>(sqlFragment`
+    SELECT COUNT(DISTINCT p.id) AS total FROM pages p
+    ${tagJoin}
+    WHERE 1=1 ${where}
+  `);
+  return Number(rows[0]?.total ?? 0);
+}
 
 export async function getAllSlugs(exec: ScopedRead, opts?: { sourceId?: string }): Promise<Set<string>> {
       // v0.31.8 (D12): two-branch. With opts.sourceId return only that

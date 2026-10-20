@@ -7,10 +7,13 @@
  */
 
 import type { Operation, OperationContext } from './contract.ts';
-import { authTransport, opError } from './contract.ts';
+import { authTransport, opError, OperationError } from './contract.ts';
+import { existsSync, realpathSync, statSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
+import { msysToNativePath } from '../path-confine.ts';
 import { hostFix, hostOnlyError, paramUse } from './op-fix.ts';
 import { isValidSourceId } from '../source-id.ts';
-import { assertSourceInCallerScope, assertSourceInCallerWriteScope, sourceScopeOpts } from './context.ts';
+import { assertSourceInCallerScope, assertSourceInCallerWriteScope, federatedSearchScope, sourceScopeOpts } from './context.ts';
 import { resolveAuthCapabilities, resolveGrantDiagnosis } from '../harness/capabilities.ts';
 
 // --- v0.28: whoami + sources management ---
@@ -175,6 +178,14 @@ const sources_add: Operation = {
         p.federated === undefined ? null : (p.federated as boolean),
       cloneDir: remoteCloneDir,
     });
+    // Local port: keep global admin OAuth clients' stored read grants current
+    // so a source registered now is immediately visible to `sources_list`
+    // through a client that was made global earlier. Best-effort — a failure
+    // here must not fail the registration that already succeeded.
+    try {
+      const { refreshGlobalOAuthReadGrants } = await import('../sources-ops.ts');
+      await refreshGlobalOAuthReadGrants(ctx.engine);
+    } catch { /* the source row is created; the grant refresh is advisory */ }
     const { redactSourceConfig } = await import('../source-config-redact.ts');
     const { parseSourceConfig } = await import('../sources-load.ts');
     return { ...row, config: redactSourceConfig(parseSourceConfig(row.config)) };
@@ -211,7 +222,11 @@ const sources_list: Operation = {
     // fail-closed '__all__' (the sentinel passes through as a literal that
     // matches no real source id, so it yields an empty listing rather than
     // the whole registry). Trusted local CLI keeps the full operator view.
-    const scope = ctx.remote === false ? {} : sourceScopeOpts(ctx);
+    // Uses federatedSearchScope (not sourceScopeOpts) so a legacy no-grant
+    // bearer token whose reads widen to the federated source set (the same
+    // visibility list_pages/search use) can enumerate those sources in the
+    // UI — otherwise the source dropdown only ever shows the scalar default.
+    const scope = ctx.remote === false ? {} : federatedSearchScope(ctx);
     const allowedSourceIds =
       scope.sourceIds ?? (scope.sourceId !== undefined ? [scope.sourceId] : undefined);
     return {
@@ -250,6 +265,10 @@ const sources_remove: Operation = {
       type: 'boolean',
       description: 'Skip clone-dir cleanup even when the source is auto-managed.',
     },
+    revoke_oauth_clients: {
+      type: 'boolean',
+      description: 'Explicitly revoke OAuth clients bound to this source before removal. Irreversibly invalidates those clients.',
+    },
   },
   mutating: true,
   scope: 'sources_admin',
@@ -269,9 +288,85 @@ const sources_remove: Operation = {
       confirmDestructive: (p.confirm_destructive as boolean) === true,
       dryRun: (p.dry_run as boolean) === true || ctx.dryRun,
       keepStorage: (p.keep_storage as boolean) === true,
+      revokeOAuthClients: (p.revoke_oauth_clients as boolean) === true,
     });
   },
   cliHints: { name: 'sources_remove', hidden: true },
+};
+
+// --- Local port: source lifecycle ops (0.48 development line) ---
+// Upstream 0.60 has no `sources_set_path` / `sources_archive` /
+// `sources_restore` MCP ops; gbrain-web's source management needs them.
+const sources_set_path: Operation = {
+  name: 'sources_set_path',
+  description: 'Update an existing source local_path without deleting its pages or embeddings. Refuses overlapping source trees.',
+  params: {
+    id: { type: 'string', required: true, description: 'Existing source id.' },
+    path: { type: 'string', required: true, description: 'New existing local directory path.' },
+    force: { type: 'boolean', description: 'Override overlap protection; use only after reviewing the conflict.' },
+  },
+  mutating: true,
+  scope: 'sources_admin',
+  handler: async (ctx, p) => {
+    const id = String(p.id);
+    const path = resolvePath(msysToNativePath(String(p.path)));
+    if (!existsSync(path) || !statSync(path).isDirectory()) throw new OperationError('invalid_params', `Path is not an existing directory: ${path}`);
+    if (ctx.remote !== false) {
+      const roots = (process.env.GBRAIN_CODE_ROOTS || '').split(':').map((item) => item.trim()).filter(Boolean);
+      if (roots.length === 0 || !roots.some((root) => {
+        try { return path === realpathSync(root) || path.startsWith(`${realpathSync(root)}/`); }
+        catch { return false; }
+      })) {
+        throw new OperationError('permission_denied', 'sources_set_path: path is outside the configured GBRAIN_CODE_ROOTS.');
+      }
+    }
+    const { assertNoOverlappingPath, SourceOpError } = await import('../sources-ops.ts');
+    if (p.force !== true) {
+      try { await assertNoOverlappingPath(ctx.engine, id, path); }
+      catch (error) { if (error instanceof SourceOpError) throw new OperationError('invalid_params', error.message); throw error; }
+    }
+    const canonical = realpathSync(path);
+    const rows = await ctx.engine.executeRaw<{ id: string; local_path: string | null }>('SELECT id, local_path FROM sources WHERE id = $1', [id]);
+    if (!rows[0]) throw new OperationError('not_found', `Source not found: ${id}`);
+    await ctx.engine.executeRaw('UPDATE sources SET local_path = $1 WHERE id = $2', [canonical, id]);
+    return { id, previous_path: rows[0].local_path, local_path: canonical, pages_preserved: true };
+  },
+  cliHints: { name: 'sources_set_path', hidden: true },
+};
+
+const sources_archive: Operation = {
+  name: 'sources_archive',
+  description: 'Archive a source while preserving its pages, chunks, embeddings, and path metadata for later restore.',
+  params: { id: { type: 'string', required: true, description: 'Source id to archive.' } },
+  mutating: true,
+  scope: 'sources_admin',
+  handler: async (ctx, p) => {
+    const id = String(p.id);
+    if (id === 'default') throw new OperationError('protected_id', 'Cannot archive the default source.');
+    const { assessDestructiveImpact, softDeleteSource } = await import('../destructive-guard.ts');
+    const impact = await assessDestructiveImpact(ctx.engine, id);
+    if (!impact) throw new OperationError('not_found', `Source not found: ${id}`);
+    const archived = await softDeleteSource(ctx.engine, id);
+    if (!archived) throw new OperationError('invalid_params', `Source is already archived or could not be archived: ${id}`);
+    return { ...archived, preserved: true };
+  },
+  cliHints: { name: 'sources_archive', hidden: true },
+};
+
+const sources_restore: Operation = {
+  name: 'sources_restore',
+  description: 'Restore an archived source without automatically synchronizing it.',
+  params: { id: { type: 'string', required: true, description: 'Archived source id.' }, no_federate: { type: 'boolean', description: 'Keep federation disabled after restore.' } },
+  mutating: true,
+  scope: 'sources_admin',
+  handler: async (ctx, p) => {
+    const id = String(p.id);
+    const { restoreSource } = await import('../destructive-guard.ts');
+    const restored = await restoreSource(ctx.engine, id, p.no_federate !== true);
+    if (!restored) throw new OperationError('not_found', `Source not found or not archived: ${id}`);
+    return { id, restored: true, synchronized: false };
+  },
+  cliHints: { name: 'sources_restore', hidden: true },
 };
 
 const sources_status: Operation = {
@@ -334,5 +429,5 @@ const sources_inspect: Operation = {
 };
 
 export const sourcesOperations: Operation[] = [
-  whoami, sources_add, sources_list, sources_remove, sources_status, sources_inspect,
+  whoami, sources_add, sources_list, sources_remove, sources_set_path, sources_archive, sources_restore, sources_status, sources_inspect,
 ];

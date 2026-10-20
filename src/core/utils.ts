@@ -236,6 +236,9 @@ export function rowToPage(row: Record<string, unknown>): Page {
     // Microsecond-exact ISO, projected by listPages for keyset resumption.
     ...(row.updated_at_iso !== undefined && { updated_at_iso: String(row.updated_at_iso) }),
     ...(deletedAt !== undefined && { deleted_at: deletedAt }),
+    // v0.51.x: tag projection, present only when the caller asked for it
+    // (list_pages include_tags). Absent SELECT projections compile unchanged.
+    ...(row.tags !== undefined && { tags: (Array.isArray(row.tags) ? row.tags : []).map(String) }),
     // v0.29.1 (columns added in migration v41). Optional in SELECT projection.
     ...(effectiveDate !== undefined && { effective_date: effectiveDate }),
     ...(effectiveDateSource !== undefined && { effective_date_source: effectiveDateSource }),

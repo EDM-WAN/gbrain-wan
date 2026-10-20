@@ -460,6 +460,14 @@ function isCustomDimValidForProvider(
     };
   }
 
+  // RealGPT's internal Qwen embedding endpoint returns a fixed 2560-wide
+  // vector while speaking the OpenAI-compatible API. It is not OpenAI's
+  // Matryoshka model, so allow only its native width and keep the exception
+  // scoped to the exact model id.
+  if (recipe.id === 'openai' && modelId.toLowerCase() === 'embedding-chattek-qwen' && requestedDims === 2560) {
+    return { valid: true, error: '' };
+  }
+
   // Tier 1: recipe-declared dims_options.
   if (dimsOptions && dimsOptions.length > 0) {
     if (dimsOptions.includes(requestedDims)) return { valid: true, error: '' };

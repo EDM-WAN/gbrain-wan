@@ -14,7 +14,7 @@ import { sanitizeRemoteBody } from '../remote-body.ts';
  */
 
 import type { Operation, OperationContext } from './contract.ts';
-import { enforceClientSlugFence, sourceScopeOpts } from './context.ts';
+import { enforceClientSlugFence, federatedSearchScope, parseSourceIdParam, sourceScopeOpts } from './context.ts';
 import { VERSION } from '../../version.ts';
 import { resolveActiveEmbeddingColumnFromEngine } from '../search/embedding-column.ts';
 import { memoizedHealth } from '../health-memo.ts';
@@ -33,15 +33,32 @@ function diagnosticScope(ctx: OperationContext): { sourceId?: string; sourceIds?
   return ctx.remote === false ? {} : sourceScopeOpts(ctx);
 }
 
+/**
+ * Per-call `source_id` for the diagnostic counters. An explicit id goes
+ * through `federatedSearchScope` so it is grant-checked like every other read
+ * (an out-of-grant id answers permission_denied, never a cross-grant
+ * existence oracle) and the caller may name a source the ctx ladder would not
+ * otherwise resolve. With NO explicit id the historical `diagnosticScope`
+ * ladder is untouched — in particular a trusted local `gbrain stats` still
+ * reports the whole brain, which `federatedSearchScope` would have silently
+ * narrowed to the scalar source.
+ */
+function diagnosticScopeWithParam(ctx: OperationContext, sourceIdParam: string | undefined): { sourceId?: string; sourceIds?: string[] } {
+  return sourceIdParam === undefined ? diagnosticScope(ctx) : federatedSearchScope(ctx, sourceIdParam);
+}
+
 const get_stats: Operation = {
   name: 'get_stats',
   mutating: false,
   idempotent: true,
   outputRedaction: 'no_stored_text',
-  description: 'Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant.',
-  params: {},
-  handler: async (ctx) => {
-    return ctx.engine.getStats(diagnosticScope(ctx));
+  description: 'Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant. Pass source_id to inspect one allowed source.',
+  params: {
+    source_id: { type: 'string', description: 'Optional source id to scope these statistics to one source visible to the caller.' },
+  },
+  handler: async (ctx, p) => {
+    const sourceIdParam = parseSourceIdParam(p.source_id, 'get_stats');
+    return ctx.engine.getStats(diagnosticScopeWithParam(ctx, sourceIdParam));
   },
   scope: 'admin',
   cliHints: { name: 'stats' },
@@ -52,16 +69,19 @@ const get_health: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'no_stored_text',
-  description: 'Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. Includes a `migrations {pending, pending_fresh_install, partial, wedged, skipped_future}` block from the host migration ledger so remote agents can detect wedged/outstanding host migrations without shelling into the brain host (pending_fresh_install = setup a new brain has not run yet, not a broken upgrade). `computed_at` is when the counters were read: a repeat call within `health.cache_ttl_ms` (default 30000; env GBRAIN_HEALTH_CACHE_TTL_MS; 0 disables) with no page or config change returns the memoized numbers.',
-  params: {},
-  handler: async (ctx) => {
+  description: 'Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. Includes a `migrations {pending, pending_fresh_install, partial, wedged, skipped_future}` block from the host migration ledger so remote agents can detect wedged/outstanding host migrations without shelling into the brain host (pending_fresh_install = setup a new brain has not run yet, not a broken upgrade). Pass source_id to inspect one allowed source. `computed_at` is when the counters were read: a repeat call within `health.cache_ttl_ms` (default 30000; env GBRAIN_HEALTH_CACHE_TTL_MS; 0 disables) with no page or config change returns the memoized numbers.',
+  params: {
+    source_id: { type: 'string', description: 'Optional source id to scope health metrics to one source visible to the caller.' },
+  },
+  handler: async (ctx, p) => {
+    const sourceIdParam = parseSourceIdParam(p.source_id, 'get_health');
     // The `migrations` block below stays GLOBAL for scoped callers by
     // decision: it is a host filesystem ledger with no per-source semantics,
     // and a wedged host migration is exactly what a remote agent needs to
     // see to explain degraded behavior.
     // F4a (O-ENG-13): memoized per engine, scope, config generation and page
     // clock (src/core/health-memo.ts); engine.getHealth itself stays uncached.
-    const scope = diagnosticScope(ctx);
+    const scope = diagnosticScopeWithParam(ctx, sourceIdParam);
     const health = await memoizedHealth(ctx.engine, scope, async () => {
       const counters = await ctx.engine.getHealth(scope);
       // #4732: name the column embed_coverage and missing_embeddings measured

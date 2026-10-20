@@ -221,6 +221,8 @@ export interface RemoveSourceOpts {
   yes?: boolean;
   dryRun?: boolean;
   keepStorage?: boolean;
+  /** Explicitly revoke OAuth clients bound to this source before removal. */
+  revokeOAuthClients?: boolean;
   requestId?: string;
   expectedIncarnation?: string;
 }
@@ -765,6 +767,59 @@ export async function addSource(
   return created;
 }
 
+/**
+ * Keep explicitly global admin OAuth clients current when a new source is
+ * registered. `--global-access` stores a federated read snapshot in
+ * `oauth_clients.federated_read`; without refreshing it, a client that was
+ * global yesterday cannot read a source added today. Only clients with
+ * `source_id IS NULL`, an existing read grant, and the explicit `admin` scope
+ * are widened. Source-bound and read-only clients remain unchanged.
+ *
+ * Local port from the 0.48 development line. Not upstream in 0.60, whose
+ * token-verification path re-derives the active source set per request
+ * (oauth-provider.ts `activeSourceIds` union) but only for clients whose
+ * stored `federated_read` is a non-empty array — an emptied or stale snapshot
+ * still degrades `sources_list` to the scalar default. This keeps the stored
+ * snapshot honest at the moment a source appears.
+ */
+export async function refreshGlobalOAuthReadGrants(
+  engine: BrainEngine,
+): Promise<{ clientsUpdated: number; activeSources: number }> {
+  const sourceRows = await engine.executeRaw<{ id: string }>(
+    `SELECT id FROM sources WHERE archived IS NOT TRUE ORDER BY id`,
+  );
+  const sourceIds = sourceRows.map((row) => row.id).filter(Boolean);
+  if (sourceIds.length === 0) return { clientsUpdated: 0, activeSources: 0 };
+
+  const clientRows = await engine.executeRaw<{
+    client_id: string;
+    scope: string | null;
+    federated_read: unknown;
+  }>(
+    `SELECT client_id, scope, federated_read
+       FROM oauth_clients
+      WHERE source_id IS NULL AND federated_read IS NOT NULL`,
+  );
+
+  let clientsUpdated = 0;
+  for (const client of clientRows) {
+    const grantedScopes = typeof client.scope === 'string' ? client.scope.split(/\s+/).filter(Boolean) : [];
+    if (!grantedScopes.includes('admin')) continue;
+    const existing = Array.isArray(client.federated_read)
+      ? client.federated_read.filter((source): source is string => typeof source === 'string')
+      : [];
+    const next = Array.from(new Set([...existing, ...sourceIds]));
+    if (next.length === existing.length && next.every((source, index) => source === existing[index])) continue;
+    await engine.executeRaw(
+      `UPDATE oauth_clients SET federated_read = $1::text[] WHERE client_id = $2`,
+      [`{${next.map((source) => `"${source.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).join(',')}}`, client.client_id],
+    );
+    clientsUpdated += 1;
+  }
+
+  return { clientsUpdated, activeSources: sourceIds.length };
+}
+
 // ── resolveDefaultSource ────────────────────────────────────────────────────
 //
 // v0.34 W0b — canonical helper for CLI commands that take an optional
@@ -918,6 +973,7 @@ export interface RemoveResult {
   pages_deleted: number;
   clone_removed: boolean;
   clone_path: string | null;
+  oauth_clients_revoked?: number;
   dryRun: boolean;
 }
 
@@ -1022,6 +1078,29 @@ export async function removeSource(
     }
   }
 
+  // OAuth clients are source-bound with an ON DELETE RESTRICT FK. A source
+  // cannot be removed while an active/revoked client still references it;
+  // revoke those client records first so source deletion is explicit and does
+  // not silently invalidate or widen a browser token.
+  const oauthClients = await engine.executeRaw<{ client_id: string }>(
+    `SELECT client_id FROM oauth_clients WHERE source_id = $1`,
+    [opts.id],
+  );
+  if (oauthClients.length > 0 && !opts.revokeOAuthClients) {
+    throw new SourceOpError(
+      'referenced',
+      `Source "${opts.id}" is still referenced by ${oauthClients.length} OAuth client(s). Revoke or rescope those clients before deleting the source.`,
+    );
+  }
+  let oauthClientsRevoked = 0;
+  if (oauthClients.length > 0 && opts.revokeOAuthClients) {
+    const revoked = await engine.executeRaw<{ client_id: string }>(
+      `DELETE FROM oauth_clients WHERE source_id = $1 RETURNING client_id`,
+      [opts.id],
+    );
+    oauthClientsRevoked = revoked.length;
+  }
+
   await deleteSourceRow(engine, opts.id);
 
   return {
@@ -1029,6 +1108,7 @@ export async function removeSource(
     pages_deleted: pageCount,
     clone_removed: cloneRemoved,
     clone_path: src.local_path,
+    oauth_clients_revoked: oauthClientsRevoked,
     dryRun: false,
   };
 }

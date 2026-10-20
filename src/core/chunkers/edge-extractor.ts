@@ -132,6 +132,15 @@ const CALL_CONFIG: Partial<Record<SupportedCodeLanguage, CallConfig>> = {
   // (`obj.Method(...)`) hold a member_access_expression, which
   // extractCalleeName resolves via its trailing-identifier fallback.
   c_sharp:    { callNodeTypes: new Set(['invocation_expression']), calleeFieldName: 'function' },
+  // Local port: tree-sitter-c / tree-sitter-cpp both expose the callee on
+  // call_expression.function. Keeping C/C++ on the conservative
+  // identifier/member path (rather than a bespoke extractor) means an
+  // embedded project's call graph is populated at all — before this they
+  // produced no call edges, so `code-callers` was empty for C sources.
+  // Receiver qualification stays unresolved until the symbol resolver has
+  // enough metadata, matching the other grammars.
+  cpp:        { callNodeTypes: new Set(['call_expression']), calleeFieldName: 'function' },
+  c:          { callNodeTypes: new Set(['call_expression']), calleeFieldName: 'function' },
 };
 
 /**

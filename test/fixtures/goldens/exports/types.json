@@ -153,6 +153,7 @@
           "listFilesForPage: (pageId: number) => Promise<FileRow[]>",
           "listLinkSources: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<{ link_source: string | null; count: number; }[]>",
           "listPages: (filters?: PageFilters) => Promise<Page[]>",
+          "listPagesCount: (filters?: PageFilters) => Promise<number>",
           "listPrefixSampledPages: (opts: DomainBankSampleOpts) => Promise<DomainBankRow[]>",
           "listStaleChunks: (opts?: { batchSize?: number; afterPageId?: number; afterChunkIndex?: number; sourceId?: string; orderBy?: \"page_id\" | \"updated_desc\"; afterUpdatedAt?: string | null; }) => Promise<StaleChunkRow[]>",
           "listStaleFrontmatterKeyPages: (opts: { sourceId: string; afterId: number; limit: number; }) => Promise<Array<{ id: number; slug: string; keys: string[]; }>>",
@@ -910,6 +911,7 @@
           "source_kind?: string | null | undefined",
           "source_path?: string | null | undefined",
           "source_uri?: string | null | undefined",
+          "tags?: string[] | undefined",
           "text_projection_revision?: string | null | undefined",
           "timeline: string",
           "title: string",
@@ -926,6 +928,7 @@
           "effective_before?: string | undefined",
           "excludePrivate?: boolean | undefined",
           "includeDeleted?: boolean | undefined",
+          "includeTags?: boolean | undefined",
           "limit?: number | undefined",
           "listColumnsOnly?: boolean | undefined",
           "offset?: number | undefined",
@@ -1126,6 +1129,7 @@
           "listFilesForPage: (pageId: number) => Promise<FileRow[]>",
           "listLinkSources: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<{ link_source: string | null; count: number; }[]>",
           "listPages: (filters?: PageFilters) => Promise<Page[]>",
+          "listPagesCount: (filters?: PageFilters) => Promise<number>",
           "listPrefixSampledPages: (opts: DomainBankSampleOpts) => Promise<DomainBankRow[]>",
           "listStaleChunks: (opts?: { batchSize?: number; afterPageId?: number; afterChunkIndex?: number; sourceId?: string; orderBy?: \"page_id\" | \"updated_desc\"; afterUpdatedAt?: string | null; }) => Promise<StaleChunkRow[]>",
           "listStaleFrontmatterKeyPages: (opts: { sourceId: string; afterId: number; limit: number; }) => Promise<{ id: number; slug: string; keys: string[]; }[]>",
@@ -1711,6 +1715,28 @@
       {
         "kind": "interface",
         "members": [
+          "abortSignal?: AbortSignal | undefined",
+          "allowFallback?: boolean | undefined",
+          "cacheSystem?: boolean | undefined",
+          "maxTokens?: number | undefined",
+          "messages: ChatMessage[]",
+          "model?: string | undefined",
+          "onFinish?: ((info: { usage?: { input_tokens: number; output_tokens: number; }; finishReason?: string; }) => void | Promise<void>) | undefined",
+          "onText: (text: string) => void | Promise<void>",
+          "providerOptions?: Record<string, Record<string, unknown>> | undefined",
+          "purpose?: string | undefined",
+          "responseSchema?: { name: string; description?: string; schema: Record<string, unknown>; } | undefined",
+          "system?: string | undefined",
+          "temperature?: number | undefined",
+          "thinking?: \"off\" | undefined",
+          "timeoutMs?: number | undefined",
+          "tools?: ChatToolDef[] | undefined"
+        ],
+        "name": "ChatStreamOpts"
+      },
+      {
+        "kind": "interface",
+        "members": [
           "description: string",
           "inputSchema: Record<string, unknown>",
           "name: string"
@@ -2048,6 +2074,13 @@
         "name": "chat",
         "signature": [
           "(opts: ChatOpts) => Promise<ChatResult>"
+        ]
+      },
+      {
+        "kind": "function",
+        "name": "chatStream",
+        "signature": [
+          "(opts: ChatStreamOpts) => Promise<void>"
         ]
       },
       {
@@ -3396,6 +3429,7 @@
           "listFilesForPage: (pageId: number) => Promise<FileRow[]>",
           "listLinkSources: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<{ link_source: string | null; count: number; }[]>",
           "listPages: (filters?: PageFilters) => Promise<Page[]>",
+          "listPagesCount: (filters?: PageFilters) => Promise<number>",
           "listPrefixSampledPages: (opts: DomainBankSampleOpts) => Promise<DomainBankRow[]>",
           "listStaleChunks: (opts?: { batchSize?: number; afterPageId?: number; afterChunkIndex?: number; sourceId?: string; orderBy?: \"page_id\" | \"updated_desc\"; afterUpdatedAt?: string | null; }) => Promise<StaleChunkRow[]>",
           "listStaleFrontmatterKeyPages: (opts: { sourceId: string; afterId: number; limit: number; }) => Promise<Array<{ id: number; slug: string; keys: string[]; }>>",
@@ -6435,6 +6469,7 @@
           "listFilesForPage: (pageId: number) => Promise<FileRow[]>",
           "listLinkSources: (opts?: { sourceId?: string; sourceIds?: string[]; }) => Promise<{ link_source: string | null; count: number; }[]>",
           "listPages: (filters?: PageFilters) => Promise<Page[]>",
+          "listPagesCount: (filters?: PageFilters) => Promise<number>",
           "listPrefixSampledPages: (opts: DomainBankSampleOpts) => Promise<DomainBankRow[]>",
           "listStaleChunks: (opts?: { batchSize?: number; afterPageId?: number; afterChunkIndex?: number; sourceId?: string; orderBy?: \"page_id\" | \"updated_desc\"; afterUpdatedAt?: string | null; }) => Promise<StaleChunkRow[]>",
           "listStaleFrontmatterKeyPages: (opts: { sourceId: string; afterId: number; limit: number; }) => Promise<{ id: number; slug: string; keys: string[]; }[]>",
@@ -7751,6 +7786,7 @@
       {
         "kind": "interface",
         "members": [
+          "abortSignal?: AbortSignal | undefined",
           "allowFallback?: boolean | undefined",
           "allowedSources?: string[] | undefined",
           "anchor?: string | undefined",
@@ -7767,6 +7803,7 @@
           "save?: boolean | undefined",
           "since?: string | undefined",
           "sourceId?: string | undefined",
+          "stream?: { onRetrieval?: (data: { pages: number; takes: number; graph: number; sourceId?: string; prefix?: string; }) => void | Promise<void>; onDelta?: (text: string, offset: number) => void | Promise<void>; } | undefined",
           "stubResponse?: ThinkResponse | undefined",
           "take?: boolean | undefined",
           "takesHoldersAllowList?: string[] | undefined",
@@ -8665,6 +8702,7 @@
           "source_kind?: string | null | undefined",
           "source_path?: string | null | undefined",
           "source_uri?: string | null | undefined",
+          "tags?: string[] | undefined",
           "text_projection_revision?: string | null | undefined",
           "timeline: string",
           "title: string",
@@ -8681,6 +8719,7 @@
           "effective_before?: string | undefined",
           "excludePrivate?: boolean | undefined",
           "includeDeleted?: boolean | undefined",
+          "includeTags?: boolean | undefined",
           "limit?: number | undefined",
           "listColumnsOnly?: boolean | undefined",
           "offset?: number | undefined",

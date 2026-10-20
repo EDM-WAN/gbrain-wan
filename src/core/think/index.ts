@@ -20,8 +20,10 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import { OperationTimeoutError, withTimeout } from '../timeout.ts';
 import type { BrainEngine, SynthesisEvidenceInput } from '../engine.ts';
-import type { SearchResult } from '../types.ts';
-import { runGather, renderPagesBlockDetailed, pagesBlockExcerptLen, takesHitToTakeForPrompt, selectRelevantExcerpt } from './gather.ts';
+import type { Page, SearchResult } from '../types.ts';
+import { runGather, renderPagesBlockDetailed, renderPrefixEnumerationBlock, renderCodeFocusedPagesBlock, pagesBlockExcerptLen, takesHitToTakeForPrompt, selectRelevantExcerpt } from './gather.ts';
+import { detectPrefixEnumeration, isPrefixOverviewQuestion, prefixCandidates } from './prefix-enumeration.ts';
+import type { CodeContext, CodeFocus } from './code-focus.ts';
 import { readThinkPagesBudget } from './pages-budget.ts';
 import { stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
 import { renderTakesBlock } from './sanitize.ts';
@@ -29,7 +31,7 @@ import { buildThinkSystemPrompt, buildThinkUserMessage } from './prompt.ts';
 import { resolveCitations, type ParsedCitation } from './cite-render.ts';
 import { resolveOwnerHolder } from '../owner-holder.ts';
 import { resolveModel } from '../model-config.ts';
-import { chat as gatewayChat, probeChatModel, isThinkingModel, type ChatResult } from '../ai/gateway.ts';
+import { chat as gatewayChat, chatStream as gatewayChatStream, probeChatModel, isThinkingModel, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
 import { normalizeModelId } from '../model-id.ts';
 import { hasAnthropicKey } from '../ai/anthropic-key.ts';
@@ -90,10 +92,35 @@ export interface RunThinkOpts {
   until?: string;
   /** When set, MCP-bound calls forward this to the gather phase (server-side filter). */
   takesHoldersAllowList?: string[];
+  /**
+   * Optional cleaned retrieval text, forwarded to the gather phase as the
+   * SEARCH key. `question` stays the synthesis input. Web Chat uses this to
+   * keep prior turns out of the retrieval query (see ThinkGatherOpts).
+   */
+  retrievalQuery?: string;
+  /**
+   * Optional recent-conversation context for SYNTHESIS ONLY. Never reaches
+   * gather — it exists so a follow-up turn's pronoun resolution works without
+   * widening what was searched.
+   */
+  conversationContext?: string;
+  /** Literal slug prefix for deterministic file/directory enumeration. */
+  slugPrefix?: string;
   /** Resolved operation-layer page visibility policy. */
   excludePrivate?: boolean;
   /** Inject an LLM client (for tests). Defaults to a fresh Anthropic SDK client. */
   client?: ThinkLLMClient;
+  /**
+   * Local port: live progress callbacks for the /think/stream SSE route.
+   * `onRetrieval` fires once after gather; `onDelta` per provider text delta.
+   * Absent for every non-streaming caller (the MCP `think` op, the CLI).
+   */
+  stream?: {
+    onRetrieval?: (data: { pages: number; takes: number; graph: number; sourceId?: string; prefix?: string }) => void | Promise<void>;
+    onDelta?: (text: string, offset: number) => void | Promise<void>;
+  };
+  /** Local port: abort the provider stream when the HTTP client disconnects. */
+  abortSignal?: AbortSignal;
   /** Inject a question-embedding function. When omitted, vector takes search is skipped. */
   embedQuestion?: (q: string) => Promise<Float32Array | null>;
   /** Pure-test escape: return synthesized payload without calling any LLM. */
@@ -543,7 +570,48 @@ function stampCitationSources(citations: ParsedCitation[], pages: SearchResult[]
   for (const c of citations) c.source_id = sourceOfSlug.get(c.page_slug) ?? null;
 }
 
-async function renderThinkPages(engine: BrainEngine, opts: RunThinkOpts, pages: SearchResult[], timeZone: string, warnings: string[]): Promise<{ pagesBlock: string; evidenceTruncated: boolean; evidenceDelivery?: DeliveryMeta }> {
+async function renderThinkPages(
+  engine: BrainEngine,
+  opts: RunThinkOpts,
+  pages: SearchResult[],
+  timeZone: string,
+  warnings: string[],
+  /**
+   * Local port — code/directory extras. These render through dedicated
+   * renderers that BYPASS the evidence plan: the two are orthogonal (the plan
+   * re-orders evidence by return-unit; the code renderer hydrates whole source
+   * files for a code ask). Both branches are narrow and self-budgeted
+   * (CODE_TOTAL_BUDGET_CHARS / PREFIX_OVERVIEW_TOTAL_BUDGET_CHARS), so an
+   * ordinary question keeps the untouched resolveEvidencePlan path below.
+   */
+  extras: {
+    deterministicPrefix?: string;
+    prefixOverview?: boolean;
+    codeFocus?: CodeFocus;
+    focusedPages?: Page[];
+    focusedContexts?: CodeContext[];
+    indexedContexts?: CodeContext[];
+  } = {},
+): Promise<{ pagesBlock: string; evidenceTruncated: boolean; evidenceDelivery?: DeliveryMeta }> {
+  // Directory questions: a deterministic, complete prefix enumeration. The
+  // caller asked "what is in this folder", so semantic ranking is the wrong
+  // instrument and the bounded full list is the answer.
+  if (extras.deterministicPrefix) {
+    return {
+      pagesBlock: renderPrefixEnumerationBlock(pages, extras.deterministicPrefix, { overview: extras.prefixOverview === true }),
+      evidenceTruncated: false,
+    };
+  }
+  // Code questions whose target file hybrid located: render the hydrated
+  // source contexts instead of generic excerpts.
+  if (extras.codeFocus?.isCodeQuestion && (extras.focusedPages?.length ?? 0) > 0) {
+    return {
+      pagesBlock: renderCodeFocusedPagesBlock(
+        extras.focusedPages!, extras.focusedContexts ?? [], extras.indexedContexts ?? [], pages, opts.question,
+      ),
+      evidenceTruncated: false,
+    };
+  }
   const [plan, budget] = await Promise.all([
     resolveEvidencePlan(engine, {
       remote: opts.remote, returnUnit: undefined, returnWindow: undefined, budget: undefined,
@@ -607,6 +675,20 @@ export async function runThink(
   const windowMeta = resolvedWindow ? { window_source: resolvedWindow.source } : {};
   const temporal = await resolveThinkTemporalContext(engine, { referenceDate: opts.referenceDate });
 
+  // Local port — deterministic folder/directory enumeration. A directory
+  // question ("nuwa 这个文件夹是干什么的") is a lookup, not a ranking problem:
+  // resolve the literal prefix so the gather can list the bounded full set.
+  // `opts.slugPrefix` (from the think op's slug_prefix param) wins over the
+  // detector so a caller can pin the prefix explicitly.
+  const prefixRequest = opts.slugPrefix
+    ? { prefix: opts.slugPrefix, source: 'question' as const }
+    : detectPrefixEnumeration(opts.question);
+  const deterministicPrefixes = prefixRequest
+    ? prefixCandidates(prefixRequest.prefix, { preferExact: prefixRequest.source === 'subtree' })
+    : [];
+  const deterministicPrefix = deterministicPrefixes[0];
+  const prefixOverview = Boolean(prefixRequest && isPrefixOverviewQuestion(opts.question));
+
   // Resolve the model through the 6-tier chain.
   const modelUsed = await resolveModel(engine, {
     cliFlag: opts.model,
@@ -646,12 +728,24 @@ export async function runThink(
     ...(opts.sourceId !== undefined ? { sourceId: opts.sourceId } : {}),
     ...(opts.allowedSources !== undefined ? { sourceIds: opts.allowedSources } : {}),
     ...(thinkDecide?.searchIntent ? { decideIntent: thinkDecide.searchIntent } : {}),
+    ...(opts.retrievalQuery ? { retrievalQuery: opts.retrievalQuery } : {}),
+    // A directory question's literal prefixes: the gather uses them to LIST the
+    // bounded set deterministically instead of ranking it.
+    ...(deterministicPrefixes.length > 0 ? { slugPrefixes: deterministicPrefixes } : {}),
   });
   // D6: per-stream gather failures surface as typed codes (GATHER_*_FAILED);
   // raw error text stays on stderr. Distinguishes an errored stream from a
   // legitimately-empty one for MCP/remote callers.
   for (const w of gather.warnings) warnings.push(w);
   if (gather.diagnostics.window?.dropped) warnings.push(`WINDOW_EXCLUDED_${gather.diagnostics.window.dropped}_PAGES`);
+  // Local port: tell a streaming caller what the gather found, before
+  // synthesis starts, so the console can show retrieval progress.
+  await opts.stream?.onRetrieval?.({
+    pages: gather.pages.length,
+    takes: gather.takes.length,
+    graph: gather.graphSlugs.length,
+    ...(opts.sourceId ? { sourceId: opts.sourceId } : {}),
+  });
   // #5575 A6: every page and take reaches the prompt with its trust tier.
   await stampPageTrust(engine, gather.pages);
   gather.takes = await stampRowTrust(engine, 'takes', gather.takes, t => ('take_id' in t ? t.take_id : (t as { id: number }).id));
@@ -660,7 +754,17 @@ export async function runThink(
   // budget-aware — 600 chars is the FLOOR (a big gather never collapses each
   // page below it) and a small gather spreads the block budget into much
   // larger, often complete, per-page windows.
-  const { pagesBlock, evidenceTruncated, evidenceDelivery } = await renderThinkPages(engine, opts, gather.pages, temporal.timeZone, warnings);
+  const { pagesBlock, evidenceTruncated, evidenceDelivery } = await renderThinkPages(
+    engine, opts, gather.pages, temporal.timeZone, warnings,
+    {
+      ...(deterministicPrefix ? { deterministicPrefix } : {}),
+      prefixOverview,
+      ...(gather.codeFocus ? { codeFocus: gather.codeFocus } : {}),
+      ...(gather.focusedPages ? { focusedPages: gather.focusedPages } : {}),
+      ...(gather.focusedContexts ? { focusedContexts: gather.focusedContexts } : {}),
+      ...(gather.indexedContexts ? { indexedContexts: gather.indexedContexts } : {}),
+    },
+  );
   const takesForPrompt = gather.takes.map(takesHitToTakeForPrompt);
   const { rendered: takesBlock, sanitizedCount } = renderTakesBlock(takesForPrompt);
   if (sanitizedCount > 0) {
@@ -745,8 +849,12 @@ export async function runThink(
                 const points = await withTimeout(
                   engine.findTrajectory({
                     entitySlug: resolved.slug,
-                    ...(opts.sourceId !== undefined ? { sourceId: opts.sourceId } : {}),
-                    ...(opts.allowedSources !== undefined ? { sourceIds: opts.allowedSources } : {}),
+                    // Local port (#4621): same scalar-wins precedence as the
+                    // gather streams — an explicit sourceId must not be widened
+                    // by a federated allowedSources array from the stream route.
+                    ...(opts.sourceId !== undefined
+                      ? { sourceId: opts.sourceId }
+                      : opts.allowedSources !== undefined ? { sourceIds: opts.allowedSources } : {}),
                     ...(opts.remote !== undefined ? { remote: opts.remote } : {}),
                     excludePrivate,
                     kind: 'all',
@@ -897,12 +1005,40 @@ export async function runThink(
     }
     let created: Anthropic.Message | null = null;
     try {
-      created = await client.create({
-        model: modelUsed,
-        max_tokens: maxOutputTokensFor(normalizeModelId(modelUsed)),
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMessage }],
-      });
+      // Local port: when the caller asked for streaming (the /think/stream SSE
+      // route) and no explicit client / test stub is in play, synthesize
+      // through the gateway's streaming path and forward each delta. The
+      // assembled text feeds the same parser below, so streaming changes
+      // latency, never the result.
+      if (opts.stream && !opts.client && !opts.stubResponse) {
+        let streamedText = '';
+        let offset = 0;
+        await gatewayChatStream({
+          model: modelUsed,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userMessage }],
+          maxTokens: maxOutputTokensFor(normalizeModelId(modelUsed)),
+          abortSignal: opts.abortSignal,
+          onText: async (delta) => {
+            streamedText += delta;
+            offset += delta.length;
+            await opts.stream?.onDelta?.(delta, offset);
+          },
+        });
+        created = {
+          id: '', type: 'message', role: 'assistant', model: modelUsed,
+          content: [{ type: 'text', text: streamedText }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+          stop_reason: 'end_turn',
+        } as unknown as Anthropic.Message;
+      } else {
+        created = await client.create({
+          model: modelUsed,
+          max_tokens: maxOutputTokensFor(normalizeModelId(modelUsed)),
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userMessage }],
+        });
+      }
     } catch (e) {
       // [ENG-10] provider/transport failures (429, timeout, 5xx, network)
       // become a typed llm_error status instead of killing the whole call —

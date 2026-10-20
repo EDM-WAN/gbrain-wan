@@ -23,7 +23,7 @@ import { createHash } from 'crypto';
 import { loadConfig, toEngineConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import type { BrainEngine } from '../core/engine.ts';
-import { assertAllowedScopes } from '../core/scope.ts';
+import { assertAllowedScopes, hasScope, parseScopeString } from '../core/scope.ts';
 import { isTrustTier, TRUST_TIERS, type TrustTier } from '../core/trust/tier.ts';
 import { setMinTrust, setTokenMinTrust } from '../core/trust/min-trust.ts';
 import { generateToken, isUndefinedColumnError, isUndefinedTableError } from '../core/utils.ts';
@@ -393,7 +393,15 @@ async function revokeClient(clientId: string) {
 export interface RegisterClientArgs {
   grantTypes: string[];
   scopes: string;
-  sourceId: string;
+  /**
+   * `--global-access` (local port #4621): a global operator client has NO write
+   * source and reads every active source. Stored as source_id=NULL +
+   * source_grant='none'; verifyAccessToken recognizes that shape (with an
+   * `admin` scope) and unions the LIVE active-source set at verification time,
+   * so a source added later is visible without an operator rescope.
+   */
+  globalAccess?: boolean;
+  sourceId: string | null;
   federatedRead: string[] | undefined;
   redirectUris: string[];
   tokenEndpointAuthMethod: string | undefined;
@@ -495,6 +503,7 @@ export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
         i += 2; break;
       }
       case '--source': out.sourceId = requireValue(); i += 2; break;
+      case '--global-access': out.globalAccess = true; out.sourceId = null; i += 1; break;
       case '--federated-read': {
         const v = requireValue();
         out.federatedRead = v.split(',').map(s => s.trim()).filter(Boolean);
@@ -603,7 +612,8 @@ export interface RegisteredClient {
   scopes: string;
   authMethod: string;
   redirectUris: string[];
-  sourceId: string;
+  /** null for a `--global-access` client: no write source; reads every active source. */
+  sourceId: string | null;
   federatedRead: string[];
   surface?: 'verbs' | 'starter' | 'full';
   tokenTtl?: number;
@@ -632,6 +642,15 @@ export async function registerScopedClient(
   opts: RegisterScopedClientOpts = {},
 ): Promise<RegisteredClient> {
   const { grantTypes, scopes, sourceId, federatedRead, redirectUris, tokenEndpointAuthMethod } = parsed;
+  // Local port #4621 — a global-access client is source_id=NULL with
+  // source_grant='none' and an EMPTY federated_read: validateClientGrant
+  // rejects the (sourcesNone, non-empty read set) combination as
+  // sources_none_inconsistent, because the live active-source set is resolved
+  // at token-verification time, not frozen into a provisioning snapshot.
+  const sourcesNone = parsed.globalAccess === true;
+  if (sourcesNone && !hasScope(parseScopeString(scopes), 'admin')) {
+    throw new Error('--global-access requires an admin scope (pass --scopes "read write admin"); without it the server will not treat the client as global');
+  }
   const agentBindings = parsed.boundTools || parsed.boundSourceId || parsed.boundBrainId ||
     parsed.boundSlugPrefixes || parsed.boundMaxConcurrent !== undefined || parsed.budgetUsdPerDay !== undefined
     ? {
@@ -648,7 +667,11 @@ export async function registerScopedClient(
   const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
   const provider = new GBrainOAuthProvider({ sql });
   const { clientId, clientSecret } = await provider.registerClientManual(
-    name, grantTypes, scopes, redirectUris, sourceId, federatedRead, tokenEndpointAuthMethod, agentBindings, opts.grant,
+    name, grantTypes, scopes, redirectUris,
+    sourcesNone ? null : sourceId,
+    sourcesNone ? [] : federatedRead,
+    tokenEndpointAuthMethod, agentBindings,
+    sourcesNone ? { ...(opts.grant ?? {}), sourcesNone: true } : opts.grant,
   );
 
   const ttl = parsed.tokenTtlSeconds ?? opts.tokenTtlSeconds;
@@ -693,7 +716,9 @@ export async function registerScopedClient(
     authMethod: tokenEndpointAuthMethod || 'client_secret_post',
     redirectUris,
     sourceId,
-    federatedRead: federatedRead && federatedRead.length > 0 ? federatedRead : [sourceId],
+    // Mirrors registerClientManual's fallback: a global client reports [] (its
+    // live read set is resolved at verification), never [null].
+    federatedRead: federatedRead && federatedRead.length > 0 ? federatedRead : (sourceId === null ? [] : [sourceId]),
     ...(tokenTtl !== undefined ? { tokenTtl } : {}),
     ...(surfaceApplied !== undefined ? { surface: surfaceApplied } : {}),
     ...(surfaceOld !== undefined ? { surfaceOld } : {}),
@@ -728,8 +753,11 @@ export function formatRegisterClientOutput(name: string, r: RegisteredClient, pa
   if (r.redirectUris.length > 0) {
     lines.push(`  Redirect URIs:       ${r.redirectUris.join(', ')}`);
   }
-  lines.push(`  Write source:        ${r.sourceId}`);
-  lines.push(`  Federated reads:     ${r.federatedRead.join(', ')}`);
+  // BYTE-IDENTICAL pin (test/auth-register-client-output-pin.test.ts): the
+  // non-global line must not change. A global client is the only case whose
+  // write source is null, so the marker is unambiguous.
+  lines.push(`  Write source:        ${r.sourceId === null ? '<global — no write source>' : r.sourceId}`);
+  lines.push(`  Federated reads:     ${r.federatedRead.length > 0 ? r.federatedRead.join(', ') : '<all active sources, resolved at verification>'}`);
   if (hasBindings) {
     lines.push(`  Bound tools:         ${(parsed.boundTools ?? []).join(', ') || '<none>'}`);
     lines.push(`  Bound source:        ${parsed.boundSourceId ?? '<none>'}`);
@@ -750,7 +778,7 @@ export function formatRegisterClientOutput(name: string, r: RegisteredClient, pa
 
 async function registerClient(name: string, args: string[]) {
   if (!name) {
-    console.error('Usage: auth register-client <name> [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD] [--token-ttl SECONDS]');
+    console.error('Usage: auth register-client <name> [--global-access] [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD] [--token-ttl SECONDS]');
     process.exit(1);
   }
   let parsed: RegisterClientArgs;
@@ -758,7 +786,7 @@ async function registerClient(name: string, args: string[]) {
     parsed = parseRegisterClientArgs(args);
   } catch (e: any) {
     console.error(`Error: ${e.message}`);
-    console.error('Usage: auth register-client <name> [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD] [--token-ttl SECONDS]');
+    console.error('Usage: auth register-client <name> [--global-access] [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD] [--token-ttl SECONDS]');
     process.exit(1);
   }
 

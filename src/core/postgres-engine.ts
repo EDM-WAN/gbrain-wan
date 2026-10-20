@@ -918,6 +918,10 @@ export class PostgresEngine implements BrainEngine {
     return this.withScopedReadTransaction(filters?.sourceIds, filters?.sourceId, tx => pagesImpl.listPages(scopedRead(this.engineSqlOn(tx)), filters));
   }
 
+  async listPagesCount(filters?: PageFilters): Promise<number> {
+    return this.withScopedReadTransaction(filters?.sourceIds, filters?.sourceId, tx => pagesImpl.listPagesCount(scopedRead(this.engineSqlOn(tx)), filters));
+  }
+
   async getAllSlugs(opts?: { sourceId?: string }): Promise<Set<string>> {
     return this.withScopedReadTransaction(undefined, opts?.sourceId, tx => pagesImpl.getAllSlugs(scopedRead(this.engineSqlOn(tx)), opts));
   }

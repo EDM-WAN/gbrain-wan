@@ -70,8 +70,12 @@ import { currentTextProjectionFilter } from '../search/safe-chunks.ts';
  * 2026-05-14T01:00:00Z — v0.34 W2: edge-extractor now emits `imports`
  * and `references` edges alongside calls. JS/TS/TSX + Python get imports;
  * TS only gets references.
+ * 2026-09-29T07:00:00Z — local port: macro fallback resolves source-scoped
+ * C/C++ `#define` targets, so edges naming a macro defined on another page
+ * resolve instead of staying unresolved. Bumping the constant makes the next
+ * resolver cycle re-walk every chunk once.
  */
-export const EDGE_EXTRACTOR_VERSION_TS = '2026-05-14T01:00:00Z';
+export const EDGE_EXTRACTOR_VERSION_TS = '2026-09-29T07:00:00Z';
 
 export const BATCH_SIZE = 200;
 
@@ -105,6 +109,53 @@ interface UnresolvedEdgeRow {
 interface ChunkCandidate {
   id: number;
   page_id: number;
+}
+
+/**
+ * Load C/C++ preprocessor definitions once per source (local port from the
+ * 0.48 line). Macro definitions are usually emitted as unnamed module chunks,
+ * so they cannot be found through symbol_name_qualified. Keeping this
+ * source-scoped and one-shot avoids the expensive "one regex per unresolved
+ * symbol per batch" query.
+ *
+ * Only reached on the fallback path — an exact same-page symbol always wins
+ * (see resolveEdges), so this can never make a real definition ambiguous.
+ */
+async function loadMacroCandidates(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<Map<string, ChunkCandidate[]>> {
+  const rows = await engine.executeRaw<{ id: number; page_id: number; chunk_text: string }>(
+    `SELECT cc.id, cc.page_id, cc.chunk_text
+       FROM content_chunks cc
+       JOIN pages p ON p.id = cc.page_id
+      WHERE p.source_id = $1
+        AND p.deleted_at IS NULL
+        AND p.page_kind = 'code'
+        AND cc.chunk_text ILIKE '%define%'`,
+    [sourceId],
+  );
+  const result = new Map<string, ChunkCandidate[]>();
+  const defineRe = /^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)/gm;
+  // Only retain one module chunk per page for a macro. A page can contain
+  // multiple chunks with the same preprocessor text due to chunk overlap;
+  // treating those as distinct definitions would turn a valid macro into an
+  // artificial ambiguous edge.
+  const pageSymbols = new Set<string>();
+  for (const row of rows) {
+    defineRe.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = defineRe.exec(row.chunk_text)) !== null) {
+      const symbol = match[1]!;
+      const key = `${row.page_id}\0${symbol}`;
+      if (pageSymbols.has(key)) continue;
+      pageSymbols.add(key);
+      const candidates = result.get(symbol) ?? [];
+      candidates.push({ id: row.id, page_id: row.page_id });
+      result.set(symbol, candidates);
+    }
+  }
+  return result;
 }
 
 /**
@@ -233,6 +284,12 @@ async function processChunkBatch(
     }
   }
 
+  // C/C++ macros are commonly defined in a different header page and their
+  // preprocessor chunk intentionally has no symbol_name_qualified. Load the
+  // source-scoped macro index once; it is reused across every resolver batch.
+  // Local port from the 0.48 line.
+  const macroCandidatesBySymbol = await loadMacroCandidates(engine, sourceId);
+
   // Resolve each edge.
   const toResolve: Array<{ edgeId: number; chunkId: number }> = [];
   const toAmbiguous: Array<{ edgeId: number; candidateIds: number[] }> = [];
@@ -246,7 +303,12 @@ async function processChunkBatch(
       continue;
     }
     const key = `${pageId}\0${e.to_symbol_qualified}`;
-    const candidates = candidatesByKey.get(key) ?? [];
+    const samePageCandidates = candidatesByKey.get(key) ?? [];
+    // Prefer an exact same-page symbol. Only when none exists fall back to the
+    // bounded source-scoped #define index (a macro is defined on another page).
+    const candidates = samePageCandidates.length > 0
+      ? samePageCandidates
+      : (macroCandidatesBySymbol.get(e.to_symbol_qualified) ?? []);
     if (candidates.length === 1) {
       toResolve.push({ edgeId: e.id, chunkId: candidates[0]!.id });
       stats.edges_resolved += 1;

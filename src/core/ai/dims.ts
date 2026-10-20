@@ -317,6 +317,10 @@ export function dimsProviderOptions(
       if (matchId === 'embo-01') {
         return { openaiCompatible: { type: 'db' } };
       }
+      // RealGPT's internal Qwen endpoint returns a fixed 2560d vector and
+      // speaks the OpenAI-compatible embeddings wire format. It is not
+      // OpenAI's Matryoshka model, so never send a `dimensions` override.
+      if (matchId === 'embedding-chattek-qwen') return undefined;
       return undefined;
   }
 }

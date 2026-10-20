@@ -1344,6 +1344,10 @@ export class PGLiteEngine implements BrainEngine {
     return plannerRead(this, this._pageTransaction, () => pagesImpl.listPages(scopedRead(this.engineSql), filters));
   }
 
+  async listPagesCount(filters?: PageFilters): Promise<number> {
+    return plannerRead(this, this._pageTransaction, () => pagesImpl.listPagesCount(scopedRead(this.engineSql), filters));
+  }
+
   async getAllSlugs(opts?: { sourceId?: string }): Promise<Set<string>> {
     return pagesImpl.getAllSlugs(scopedRead(this.engineSql), opts);
   }

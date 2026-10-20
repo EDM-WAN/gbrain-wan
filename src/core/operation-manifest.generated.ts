@@ -458,6 +458,18 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "source_id": {
         "type": "string",
         "description": "One source, or '__all__'."
+      },
+      "slug_prefix": {
+        "type": "string",
+        "description": "Literal prefix filter for page slugs, for example wiki/error-. Use with pagination to enumerate a folder or filename prefix."
+      },
+      "include_tags": {
+        "type": "boolean",
+        "description": "Include page tags in the list response using one batched query. Default false."
+      },
+      "include_total": {
+        "type": "boolean",
+        "description": "v0.51.x: when true, return { total, limit, offset, has_more, pages } instead of a bare array. total is one COUNT(*) matching the same filters."
       }
     },
     "scope": "read",
@@ -466,6 +478,60 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "name": "list"
     },
     "area": "pages"
+  },
+  {
+    "name": "source_inventory",
+    "description": "Return a source-scoped folder inventory and one paginated batch of direct files. Intended for large Memory Library sources; does not enumerate every page into the client.",
+    "params": {
+      "source_id": {
+        "type": "string",
+        "required": true,
+        "description": "One source id."
+      },
+      "folder": {
+        "type": "string",
+        "description": "Folder path in the source file namespace. Empty string means the root."
+      },
+      "limit": {
+        "type": "number",
+        "description": "Direct files per batch (default 48, max 100)."
+      },
+      "offset": {
+        "type": "number",
+        "description": "Offset within direct files."
+      },
+      "type": {
+        "type": "string",
+        "description": "Optional page type filter."
+      },
+      "tag": {
+        "type": "string",
+        "description": "Optional tag filter."
+      },
+      "sort": {
+        "type": "string",
+        "enum": [
+          "updated_desc",
+          "updated_asc",
+          "created_desc",
+          "slug"
+        ],
+        "description": "Page ordering for stable pagination."
+      },
+      "recursive": {
+        "type": "boolean",
+        "description": "Include every descendant file in the folder; empty folder means the entire source and should only be used with pagination/dry-run."
+      },
+      "include_source_id": {
+        "type": "boolean",
+        "description": "Include each folder entry source_id in cross-source inventory responses."
+      }
+    },
+    "scope": "read",
+    "cliHints": {
+      "name": "source_inventory",
+      "hidden": true
+    }
   },
   {
     "name": "restore_page",
@@ -504,6 +570,42 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       ]
     },
     "area": "pages"
+  },
+  {
+    "name": "purge_pages",
+    "description": "Permanently delete a bounded batch of source-scoped pages immediately. This is irreversible and cascades chunks, embeddings, links, timeline, tags, versions, and code edges. Requires admin scope and explicit confirmation.",
+    "idempotent": false,
+    "outputRedaction": "no_stored_text",
+    "params": {
+      "slugs": {
+        "type": "array",
+        "required": true,
+        "items": {
+          "type": "string"
+        },
+        "description": "Page slugs to permanently delete (max 200). All must belong to source_id."
+      },
+      "source_id": {
+        "type": "string",
+        "required": true,
+        "description": "Source holding the pages."
+      },
+      "confirm_destructive": {
+        "type": "boolean",
+        "required": true,
+        "description": "Must be true to perform irreversible deletion."
+      },
+      "dry_run": {
+        "type": "boolean",
+        "description": "Return impact without deleting."
+      }
+    },
+    "mutating": true,
+    "scope": "admin",
+    "cliHints": {
+      "name": "purge_pages",
+      "hidden": true
+    }
   },
   {
     "name": "purge_deleted_pages",
@@ -1912,8 +2014,13 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant.",
-    "params": {},
+    "description": "Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant. Pass source_id to inspect one allowed source.",
+    "params": {
+      "source_id": {
+        "type": "string",
+        "description": "Optional source id to scope these statistics to one source visible to the caller."
+      }
+    },
     "scope": "admin",
     "cliHints": {
       "name": "stats"
@@ -1925,8 +2032,13 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. Includes a `migrations {pending, pending_fresh_install, partial, wedged, skipped_future}` block from the host migration ledger so remote agents can detect wedged/outstanding host migrations without shelling into the brain host (pending_fresh_install = setup a new brain has not run yet, not a broken upgrade). `computed_at` is when the counters were read: a repeat call within `health.cache_ttl_ms` (default 30000; env GBRAIN_HEALTH_CACHE_TTL_MS; 0 disables) with no page or config change returns the memoized numbers.",
-    "params": {},
+    "description": "Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. Includes a `migrations {pending, pending_fresh_install, partial, wedged, skipped_future}` block from the host migration ledger so remote agents can detect wedged/outstanding host migrations without shelling into the brain host (pending_fresh_install = setup a new brain has not run yet, not a broken upgrade). Pass source_id to inspect one allowed source. `computed_at` is when the counters were read: a repeat call within `health.cache_ttl_ms` (default 30000; env GBRAIN_HEALTH_CACHE_TTL_MS; 0 disables) with no page or config change returns the memoized numbers.",
+    "params": {
+      "source_id": {
+        "type": "string",
+        "description": "Optional source id to scope health metrics to one source visible to the caller."
+      }
+    },
     "scope": "admin",
     "cliHints": {
       "name": "health"
@@ -3045,6 +3157,10 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "lock_duration_ms": {
         "type": "number",
         "description": "Per-job lock lease in ms (#4145). Out-of-range values are clamped to [5000, 3600000] — remote writers cannot pin an immortal lock. Omit to use the handler-type default (300s for long LLM handlers) or the worker default (30s)."
+      },
+      "idempotency_key": {
+        "type": "string",
+        "description": "Optional caller-owned key; a repeated submit with the same key returns the existing job instead of enqueuing a duplicate."
       }
     },
     "mutating": true,
@@ -3522,6 +3638,22 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "until": {
         "type": "string",
         "description": "End of temporal window"
+      },
+      "source_id": {
+        "type": "string",
+        "description": "Scope synthesis retrieval to one source. Explicit source IDs must be granted; '__all__' spans the caller's granted sources remotely."
+      },
+      "slug_prefix": {
+        "type": "string",
+        "description": "Literal page-slug prefix for deterministic file enumeration, for example wiki/error-."
+      },
+      "retrieval_query": {
+        "type": "string",
+        "description": "Optional cleaned retrieval text; kept separate from the user question used for synthesis."
+      },
+      "conversation_context": {
+        "type": "string",
+        "description": "Optional recent conversation context for synthesis only; never used to widen retrieval scope."
       },
       "reference_date": {
         "type": "string",
@@ -4016,6 +4148,10 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "keep_storage": {
         "type": "boolean",
         "description": "Skip clone-dir cleanup even when the source is auto-managed."
+      },
+      "revoke_oauth_clients": {
+        "type": "boolean",
+        "description": "Explicitly revoke OAuth clients bound to this source before removal. Irreversibly invalidates those clients."
       }
     },
     "mutating": true,
@@ -4025,6 +4161,70 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "hidden": true
     },
     "area": "sources"
+  },
+  {
+    "name": "sources_set_path",
+    "description": "Update an existing source local_path without deleting its pages or embeddings. Refuses overlapping source trees.",
+    "params": {
+      "id": {
+        "type": "string",
+        "required": true,
+        "description": "Existing source id."
+      },
+      "path": {
+        "type": "string",
+        "required": true,
+        "description": "New existing local directory path."
+      },
+      "force": {
+        "type": "boolean",
+        "description": "Override overlap protection; use only after reviewing the conflict."
+      }
+    },
+    "mutating": true,
+    "scope": "sources_admin",
+    "cliHints": {
+      "name": "sources_set_path",
+      "hidden": true
+    }
+  },
+  {
+    "name": "sources_archive",
+    "description": "Archive a source while preserving its pages, chunks, embeddings, and path metadata for later restore.",
+    "params": {
+      "id": {
+        "type": "string",
+        "required": true,
+        "description": "Source id to archive."
+      }
+    },
+    "mutating": true,
+    "scope": "sources_admin",
+    "cliHints": {
+      "name": "sources_archive",
+      "hidden": true
+    }
+  },
+  {
+    "name": "sources_restore",
+    "description": "Restore an archived source without automatically synchronizing it.",
+    "params": {
+      "id": {
+        "type": "string",
+        "required": true,
+        "description": "Archived source id."
+      },
+      "no_federate": {
+        "type": "boolean",
+        "description": "Keep federation disabled after restore."
+      }
+    },
+    "mutating": true,
+    "scope": "sources_admin",
+    "cliHints": {
+      "name": "sources_restore",
+      "hidden": true
+    }
   },
   {
     "name": "sources_status",
@@ -5593,6 +5793,29 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "hidden": true
     },
     "area": "admin"
+  },
+  {
+    "name": "code_graph",
+    "description": "Build a bounded source-scoped code call graph from indexed symbols and edges. Nodes are functions/classes/types and edges are calls, imports, or references. Use source_id for one repository; unresolved symbol targets are included as unresolved nodes.",
+    "params": {
+      "limit": {
+        "type": "number",
+        "description": "Maximum edge rows. Default 300, max 500."
+      },
+      "source_id": {
+        "type": "string",
+        "description": "Scope to one source. Defaults to the caller grant; '__all__' spans granted sources for remote callers."
+      },
+      "all_sources": {
+        "type": "boolean",
+        "description": "Span all granted sources."
+      }
+    },
+    "scope": "read",
+    "cliHints": {
+      "name": "code_graph",
+      "hidden": true
+    }
   },
   {
     "name": "migrate_embeddings",

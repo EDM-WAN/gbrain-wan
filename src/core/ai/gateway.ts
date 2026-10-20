@@ -22,6 +22,7 @@
  */
 
 import type { embedMany, generateObject, generateText, JSONSchema7, Output } from 'ai';
+import { streamText } from 'ai';
 import { jsonSchema } from '@ai-sdk/provider-utils';
 import { installAiSdkWarningWriter } from './sdk-warnings.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -183,6 +184,16 @@ const loadAiSdk = () => (aiSdk ??= import('ai'));
 const sdkEmbedMany = (async (opts: Parameters<EmbedManyFn>[0]) => (await loadAiSdk()).embedMany(opts)) as EmbedManyFn;
 const sdkGenerateText = (async (opts: Parameters<GenerateTextFn>[0]) => (await loadAiSdk()).generateText(opts)) as GenerateTextFn;
 const sdkGenerateObject = (async (opts: Parameters<GenerateObjectFn>[0]) => (await loadAiSdk()).generateObject(opts as never)) as GenerateObjectFn;
+// Streaming seam: chatStream()'s SDK call. Mirrors _generateTextTransport so
+// the streaming lifecycle is testable without a provider (the path shipped
+// with no coverage, which is how a broken drain went unnoticed).
+// NOT a lazy `import('ai')` wrapper: `streamText` is statically imported
+// above and — critically — it must stay SYNCHRONOUS. Wrapping it in an async
+// function returns Promise<StreamTextResult>, so `.textStream` is undefined at
+// the drain site and every streaming call dies with
+// "undefined is not an object (evaluating 'delta of stream.textStream')".
+const sdkStreamText: typeof streamText = streamText;
+let _streamTextTransport: typeof streamText = sdkStreamText;
 let _embedTransport: EmbedManyFn = sdkEmbedMany;
 let _generateTextTransport: GenerateTextFn = sdkGenerateText;
 // Test-only seam for expand()'s structured-output SDK call. Mirrors
@@ -800,6 +811,21 @@ export function __setGenerateTextTransportForTests(fn: GenerateTextFn | null): v
  */
 export function __setGenerateObjectTransportForTests(fn: GenerateObjectFn | null): void {
   _generateObjectTransport = fn ?? sdkGenerateObject;
+}
+
+/**
+ * Test-only seam for chatStream()'s SDK call. Mirrors
+ * `__setGenerateTextTransportForTests`: provider resolution and
+ * providerOptions assembly stay live; only the final `streamText` call is
+ * replaced. The fake must return a StreamTextResult-shaped object (a
+ * `textStream` async iterable plus `totalUsage`/`finishReason` promises),
+ * because the shape of that return value is exactly what the streaming path
+ * depends on.
+ *
+ * @internal exported for tests; not part of the public gateway API.
+ */
+export function __setStreamTextTransportForTests(fn: typeof streamText | null): void {
+  _streamTextTransport = fn ?? sdkStreamText;
 }
 
 /**
@@ -3854,6 +3880,71 @@ async function chatAdmitted(opts: ChatOpts, admitted: {
     _recordBudget(failedCallUsage(err, { inputTokens: estimatedInputTokens, outputTokens: maxOutputTokens }));
     throw normalizeAIError(err, `chat(${recipe.id}:${modelId})`, redactKeys, gatewayModelNotFoundHint('chat', modelStr));
   }
+}
+
+// ---- Streaming chat (local port from the 0.48 development line) ----
+
+export interface ChatStreamOpts extends ChatOpts {
+  /** Receive provider text deltas as they arrive. */
+  onText: (text: string) => void | Promise<void>;
+  /** Optional lifecycle callback after the provider stream finishes. */
+  onFinish?: (info: { usage?: { input_tokens: number; output_tokens: number }; finishReason?: string }) => void | Promise<void>;
+}
+
+/**
+ * Stream provider text while preserving the same model/provider resolution as
+ * `chat`. Additive: existing callers keep using generateText.
+ *
+ * Weighted like the other SDK paths rather than calling streamText directly —
+ * the admission guard (`invokeAI`) is what meters spend and enforces the
+ * brain's budget, so a streaming call that skipped it would be free and
+ * uncapped. Mirrors the guardedGeneration body: a guarded brain gets
+ * maxRetries 0 (the guard owns retries), an unguarded one keeps SDK retries.
+ */
+export async function chatStream(opts: ChatStreamOpts): Promise<void> {
+  await discoverBeforeOpenAICall(opts.model ?? _config?.chat_model);
+  const modelStr = opts.model ?? getChatModel();
+  const { model, recipe, modelId } = await resolveChatProvider(modelStr);
+  const cfg = requireConfig();
+  const providerOptions: Record<string, any> = {};
+  applyConfiguredChatProviderOptions(providerOptions, cfg, recipe.id, modelId);
+  const maxOutputTokens = opts.maxTokens ?? defaultMaxOutputTokens(modelStr);
+
+  // The admission guard meters spend, so the streaming call must run INSIDE
+  // `invokeAI` — but `invokeAI` awaits its `run()` result, and a StreamTextResult
+  // is thenable: awaiting it consumes the stream and the returned value no
+  // longer carries `textStream`. So the whole streaming lifecycle (create →
+  // drain → read usage) is the guarded unit, and the sum returned to the guard
+  // is the usage the finished stream reported.
+  const streamed = await invokeAI(
+    chatInvocation('gateway.stream', modelStr, maxOutputTokens),
+    async () => {
+      const stream = _streamTextTransport({
+        model,
+        system: opts.system,
+        messages: toModelMessages(repairToolPairing(opts.messages)) as any,
+        tools: opts.tools && opts.tools.length > 0 ? toAISDKTools(opts.tools) : undefined,
+        maxOutputTokens,
+        abortSignal: withDefaultTimeout(opts.abortSignal, AI_CHAT_TIMEOUT_MS),
+        providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
+      });
+      for await (const delta of stream.textStream) await opts.onText(delta);
+      const usage = await stream.totalUsage;
+      return {
+        inputTokens: Number(usage.input_tokens ?? 0),
+        outputTokens: Number(usage.output_tokens ?? 0),
+        finishReason: await stream.finishReason,
+      };
+    },
+    // The guard reads this instead of `sdkInvocationUsage` (which expects a
+    // generateText-shaped result and would find no `usage` on our wrapper).
+    (r) => ({ inputTokens: r.inputTokens, outputTokens: r.outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0 }),
+  );
+
+  await opts.onFinish?.({
+    usage: { input_tokens: streamed.inputTokens, output_tokens: streamed.outputTokens },
+    finishReason: streamed.finishReason,
+  });
 }
 
 // ---- Tool loop (v0.38 — D11 + D6/D7 gateway-native subagent path) ----

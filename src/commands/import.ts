@@ -259,6 +259,13 @@ export async function runImport(
     /** #5988: each file's outcome (a throw arrives as `{ status: 'error', error }`); `'held'` = the caller held it, not a failure. */
     onFileResult?: (path: string, filePath: string, result: Pick<ImportResult, 'status' | 'error' | 'refusal' | 'frontmatter_recovery' | 'fences_normalized' | 'fence_issues'>) => Promise<'held' | undefined>;
     /**
+     * File-grain progress for a caller that reports it (minions import job →
+     * job.progress → the web console's "N/M files" readout). Called once per
+     * file with the same counters the stderr progress line uses; in-process
+     * callers that pass nothing are unaffected.
+     */
+    onProgress?: (done: number, total: number) => void;
+    /**
      * #753/#774: glob patterns to exclude from the import (same semantics as
      * `isSyncable`'s `exclude` — matched against the dir-relative path).
      * Threaded by performFullSync for `gbrain sync --exclude`.
@@ -293,6 +300,25 @@ export async function runImport(
   const noEmbed = args.includes('--no-embed');
   const allowNoncanonicalRoot = args.includes('--allow-noncanonical-root');
   const fresh = args.includes('--fresh');
+  // A direct directory import can select the same chunker lane a full sync
+  // uses. Web-console and SDK drop-folder imports need this: they bypass
+  // performFullSync, so without it a code drop silently imported as markdown
+  // and produced no code chunks or call edges.
+  const strategyFlagIndex = args.indexOf('--strategy');
+  const strategyFlag = strategyFlagIndex >= 0 ? args[strategyFlagIndex + 1] : undefined;
+  const cliStrategy: SyncStrategy | undefined = args.includes('--code')
+    ? 'code'
+    : strategyFlag === 'code' || strategyFlag === 'auto' || strategyFlag === 'markdown'
+      ? strategyFlag
+      : undefined;
+  // Same reason as cliStrategy: `--exclude` was only reachable via
+  // performFullSync (`gbrain sync --exclude`), so a direct `gbrain import
+  // --exclude` was accepted by the flag registry and then silently ignored.
+  const cliExclude: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--exclude' && i + 1 < args.length) cliExclude.push(args[i + 1]!);
+  }
+  const excludePatterns = Array.from(new Set([...(opts.exclude ?? []), ...cliExclude]));
   const jsonOutput = args.includes('--json');
   // #3969: opt back into per-poll ingest_log rows (default: no-op runs skip the write).
   const logNoop = args.includes('--log-noop');
@@ -556,7 +582,7 @@ export async function runImport(
   // collectMarkdownFiles unconditionally — code-strategy first sync
   // silently no-op'd because no code file ever made it through walker
   // enumeration (codex C11 confirms dispatch was correct; bug was here).
-  const strategy: SyncStrategy = opts.strategy ?? 'markdown';
+  const strategy: SyncStrategy = opts.strategy ?? cliStrategy ?? 'markdown';
   const _walkT0 = Date.now();
   console.error(`[gbrain phase] import.collect_files start dir=${dir} strategy=${strategy}`);
   const malformedExcluded: string[] = [];
@@ -580,19 +606,20 @@ export async function runImport(
   }
   const fileTypeLabel = strategy === 'code' ? 'code'
     : strategy === 'auto' ? 'syncable' : 'markdown';
-  // #753/#774: apply --exclude glob patterns (threaded by performFullSync).
-  if (!company && opts.exclude && opts.exclude.length > 0) {
+  // #753/#774: apply --exclude glob patterns (threaded by performFullSync,
+  // or read straight off argv for a direct `gbrain import --exclude`).
+  if (!company && excludePatterns.length > 0) {
     const beforeExclude = allFiles.length;
-    allFiles = allFiles.filter(abs => !matchesAnyGlob(relative(dir, abs), opts.exclude));
+    allFiles = allFiles.filter(abs => !matchesAnyGlob(relative(dir, abs), excludePatterns));
     info(
       `Found ${allFiles.length} ${fileTypeLabel} files ` +
-      `(${beforeExclude - allFiles.length} excluded by --exclude patterns)`,
+      `(${beforeExclude - allFiles.length} excluded by --exclude patterns: ${excludePatterns.join(', ')})`,
     );
     // NAV-4: everything excluded is almost always a mistyped pattern — warn.
     if (beforeExclude > 0 && allFiles.length === 0) {
       console.warn(
-        `[gbrain sync] No files matched after applying ${opts.exclude.length} --exclude pattern(s). ` +
-        `Check your --exclude flags. Patterns: ${JSON.stringify(opts.exclude)}`,
+        `[gbrain sync] No files matched after applying ${excludePatterns.length} --exclude pattern(s). ` +
+        `Check your --exclude flags. Patterns: ${JSON.stringify(excludePatterns)}`,
       );
     }
   } else {
@@ -692,6 +719,9 @@ export async function runImport(
 
   function tickProgress() {
     progress.tick(1, `imported=${imported} skipped=${skipped} errors=${errors}`);
+    // minions import job: mirror the counters onto job.progress so the web
+    // console can render "N/M files" without polling ingest_log.
+    opts.onProgress?.(imported + skipped + errors, files.length);
   }
 
   // A12 (opt-in): git first-commit dates anchor undated new pages instead of clone-time mtimes.

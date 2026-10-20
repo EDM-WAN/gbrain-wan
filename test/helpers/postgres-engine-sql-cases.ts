@@ -86,6 +86,7 @@ export const DOMAIN_OF: Record<string, string> = {
   'softDeletePage': 'pages', 'softDeletePages': 'pages', 'restorePage': 'pages', 'purgeDeletedPages': 'pages',
   'refreshPageBody': 'pages', 'updatePageContextualRetrievalState': 'pages', 'listPages': 'pages',
   'getAllSlugs': 'pages', 'listAllPageRefs': 'pages', 'listPrefixSampledPages': 'pages', 'listCorpusSample': 'pages',
+  'listPagesCount': 'pages',
   'resolveSlugs': 'pages', 'findByTitleFuzzy': 'pages', 'getPageTimestamps': 'pages',
   'createVersion': 'pages', 'getVersions': 'pages', 'revertToVersion': 'pages', 'updateSlug': 'pages',
   'resolveSlugWithAlias': 'pages', 'resolveSlugWithAliasDetailed': 'pages', 'setPageAliases': 'pages',
@@ -327,6 +328,22 @@ export const SQL_CASES: SqlCase[] = [
     ['effective_after', (e) => e.listPages({ effective_after: '2026-01-01' })],
     ['effective_before', (e) => e.listPages({ effective_before: '2026-01-01' })],
     ['sort', (e) => e.listPages({ sort: 'slug' })],
+  ]),
+  // listPagesCount must emit the SAME predicate chain as listPages (minus
+  // the ORDER BY / LIMIT / OFFSET window) — pinning both here is what keeps
+  // a listing and its `include_total` count from drifting apart.
+  ...variants('listPagesCount', [
+    ['default', (e) => e.listPagesCount()],
+    ['type', (e) => e.listPagesCount({ type: 'person' })],
+    ['tag', (e) => e.listPagesCount({ tag: 'founder' })],
+    ['updated_after', (e) => e.listPagesCount({ updated_after: '2026-01-01T00:00:00Z' })],
+    ['slugPrefix', (e) => e.listPagesCount({ slugPrefix: 'people/' })],
+    ['sourceId', (e) => e.listPagesCount({ sourceId: SRC })],
+    ['sourceIds', (e) => e.listPagesCount({ sourceIds: SRCS })],
+    ['includeDeleted', (e) => e.listPagesCount({ includeDeleted: true })],
+    ['excludePrivate', (e) => e.listPagesCount({ excludePrivate: true })],
+    ['effective_after', (e) => e.listPagesCount({ effective_after: '2026-01-01' })],
+    ['effective_before', (e) => e.listPagesCount({ effective_before: '2026-01-01' })],
   ]),
   ...variants('getAllSlugs', [
     ['default', (e) => e.getAllSlugs()],

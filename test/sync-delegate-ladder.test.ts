@@ -93,13 +93,30 @@ describe('parseDelegatedSyncArgs (default-deny)', () => {
   });
 
   test.each([
-    ['--repo'], ['--watch'], ['--all'], ['--workers'], ['--concurrency'],
+    ['--repo'], ['--watch'], ['--all'],
     ['--exclude'], ['--src-subpath'], ['--break-lock'],
     ['--force-break-lock'], ['--max-age'], ['--missing-path'], ['--parallel'],
-    ['--interval'], ['--serial'], ['--strategy'], ['trigger'],
+    ['--interval'], ['--serial'], ['trigger'],
     ['--some-flag-added-in-2027'],
   ])('refuses %s by name (default-deny)', (tok) => {
     expect(parseDelegatedSyncArgs([tok])).toEqual({ ok: false, refused: tok });
+  });
+
+  test('Plan D: --strategy / --workers / --concurrency are admitted and forwarded', () => {
+    // These reach the child sync as DelegatedSyncOptions; before the port the
+    // ladder rejected them and a delegated run silently used the child default.
+    expect(parseDelegatedSyncArgs(['--strategy', 'code'])).toEqual({ ok: true, explicitSource: null, options: { strategy: 'code' } });
+    for (const s of ['markdown', 'auto']) {
+      expect(parseDelegatedSyncArgs(['--strategy', s]).ok).toBe(true);
+    }
+    expect(parseDelegatedSyncArgs(['--workers', '4'])).toEqual({ ok: true, explicitSource: null, options: { concurrency: 4 } });
+    expect(parseDelegatedSyncArgs(['--concurrency', '2'])).toEqual({ ok: true, explicitSource: null, options: { concurrency: 2 } });
+
+    // Invalid values refuse the ladder rather than falling through to an
+    // auto-concurrency run (parseWorkers is the same validator the local path uses).
+    for (const bad of [['--strategy', 'nonsense'], ['--workers', '0'], ['--workers', 'foo'], ['--workers', '1.5'], ['--concurrency', '-3']]) {
+      expect(parseDelegatedSyncArgs(bad).ok).toBe(false);
+    }
   });
 
   test('#6317: the managed catch-up flags are admitted explicitly (--json is rendered by this client, never forwarded)', () => {

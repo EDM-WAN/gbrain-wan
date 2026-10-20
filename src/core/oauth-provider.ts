@@ -841,13 +841,40 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       if (allowedSources === undefined && rowSourceId !== undefined) {
         allowedSources = [rowSourceId];
       }
+      // Local port (#4621): a global admin client is identified by the
+      // deliberate combination of source_id=NULL and an admin grant (the shape
+      // `auth register-client --global-access` emits). Its federated_read
+      // column is a provisioning snapshot, so resolve the ACTIVE source set at
+      // token-verification time as well — otherwise a source added after the
+      // client was registered stays invisible until an operator manually
+      // rescopes it (which is exactly how gbrain-web's source dropdown ended up
+      // showing only `default`).
+      const tokenScopes = Array.isArray(row.scopes) ? (row.scopes as string[]) : [];
+      const isGlobalAdminClient = rowSourceId === undefined && tokenScopes.includes('admin');
       // Grant membership is live: archiving a previously granted source must
       // not leave its old snapshot readable. A wholly inactive grant exposes
       // no operations; authenticated capability metadata can explain why.
       if (rowSourceId !== undefined && row.source_active === false) effectiveScopes.length = 0;
       if (allowedSources?.length && Array.isArray(row.active_read_sources)) {
-        allowedSources = allowedSources.filter(id => (row.active_read_sources as string[]).includes(id));
-        if (allowedSources.length === 0) effectiveScopes.length = 0;
+        // The SQL derives active_read_sources from the federated_read SNAPSHOT,
+        // which a global admin client by definition outgrows. Filtering the
+        // union below against that stale array would remove exactly the
+        // newly-added sources this port exists to expose, so a global admin
+        // client skips the snapshot filter: its live set is computed from the
+        // sources table in the union below (archived rows excluded there).
+        if (!isGlobalAdminClient) {
+          allowedSources = allowedSources.filter(id => (row.active_read_sources as string[]).includes(id));
+          if (allowedSources.length === 0) effectiveScopes.length = 0;
+        }
+      }
+      if (isGlobalAdminClient) {
+        const activeSourceRows = await this.sql`
+          SELECT id FROM sources WHERE archived IS NOT TRUE ORDER BY id
+        `;
+        const activeSourceIds = activeSourceRows
+          .map((source) => (typeof source.id === 'string' ? source.id : ''))
+          .filter(Boolean);
+        allowedSources = Array.from(new Set([...(allowedSources ?? []), ...activeSourceIds]));
       }
       // v0.42.72.0: slug-prefix write binding. Array (even empty — the
       // fence treats [] as deny-all, matching submit_agent's fail-closed
@@ -908,7 +935,11 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // v0.34.1 (#876): federated read scope. sourceScopeOpts in
         // operations.ts prefers this array over scalar sourceId when set
         // and non-empty.
-        allowedSources: sourcesNone ? [] : allowedSources,
+        // A `sources_none` client has no source grant — EXCEPT a global admin
+        // client, which shares the source_id=NULL shape but reads every active
+        // source. Its union is computed above; discarding it here would leave
+        // the very client the union exists for with an empty read scope.
+        allowedSources: sourcesNone && !isGlobalAdminClient ? [] : allowedSources,
         ...(sourcesNone ? { hasSourceGrant: true } : {}),
         // Per-client takes holders; undefined → the /mcp dispatch site's fail-closed ['world'].
         ...(clientHolders ? { takesHoldersAllowList: clientHolders } : {}),
@@ -1047,7 +1078,10 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     grantTypes: string[],
     scopes: string,
     redirectUris: string[] = [],
-    sourceId: string = 'default',
+    // null = a global-access client (source_id NULL, no write source). Only
+    // reachable via `auth register-client --global-access`, which also forces
+    // source_grant='none' + an empty federated_read through grantPatch.
+    sourceId: string | null = 'default',
     federatedRead?: string[],
     tokenEndpointAuthMethod?: string,
     agentBindings?: AgentClientBindings,
@@ -1099,7 +1133,13 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     //   source_id = 'default' (matches v60 backfill)
     //   federated_read = [source_id] when omitted (a non-federated client
     //                    has read scope == write scope, the v0.33 default)
-    const federated = federatedRead && federatedRead.length > 0 ? federatedRead : [sourceId];
+    // A null sourceId is the global-access shape: an empty read set is
+    // REQUIRED (validateClientGrant rejects sourcesNone with a non-empty
+    // federatedRead as sources_none_inconsistent), so never synthesize
+    // [sourceId] here — that would produce [null].
+    const federated = federatedRead && federatedRead.length > 0
+      ? federatedRead
+      : sourceId === null ? [] : [sourceId];
     const schema = await this.sql`SELECT column_name FROM information_schema.columns
       WHERE table_schema = current_schema() AND table_name = 'oauth_clients'
         AND column_name IN ('grant_revision', 'allowed_operations', 'delegated_slug_prefixes', 'delegated_namespace', 'grant_profile', 'grant_repair_reasons', 'surface', 'surface_set_by', 'token_ttl', 'source_id', 'federated_read', 'bound_slug_prefixes', 'bound_tools', 'bound_source_id', 'bound_brain_id', 'bound_max_concurrent', 'budget_usd_per_day')`;

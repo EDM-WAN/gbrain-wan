@@ -26,9 +26,69 @@ import { DEFAULT_PAGES_BUDGET, PAGES_BLOCK_EXCERPT_FLOOR_CHARS, type PagesBudget
 import { filterPagesToWindow, type TemporalWindow } from './temporal-window.ts';
 import { pageContentDate } from './temporal-context.ts';
 import { sanitizeQueryForPrompt } from '../search/expansion.ts';
+import { cleanThinkRetrievalQuery, isExactTitleMatch } from './retrieval-query.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 import { CJK_SLUG_CHARS } from '../cjk.ts';
 import type { IntentAsk } from '../search/decide-retrieval.ts';
+import { codeFocusKey, detectCodeFocus, expandLocalHelperContexts, extractCalledSymbols, extractCodeContexts, selectCodeFocusHits, type CodeContext, type CodeFocus } from './code-focus.ts';
+import { PREFIX_OVERVIEW_TOTAL_BUDGET_CHARS, PREFIX_OVERVIEW_PAGE_MAX_CHARS, prefixCandidates } from './prefix-enumeration.ts';
+
+/**
+ * One row from the indexed-symbol lookup: a code helper that the call graph
+ * knows about, resolved straight from `content_chunks` rather than from
+ * semantic retrieval.
+ */
+interface IndexedCodeContextRow {
+  slug: string;
+  source_id: string;
+  symbol_name: string;
+  chunk_text: string;
+  start_line: number | null;
+  end_line: number | null;
+  file: string | null;
+}
+
+const INDEXED_HELPER_LIMIT = 8;
+
+/**
+ * Resolve called-helper symbols against the CODE INDEX rather than against
+ * search: a helper the question's target file calls is evidence even when no
+ * retrieval leg ranks it. Source-scoped with the same scalar-wins precedence
+ * as every other gather stream (#4621).
+ */
+async function findIndexedCodeHelpers(
+  engine: BrainEngine,
+  symbols: string[],
+  opts: Pick<ThinkGatherOpts, 'sourceId' | 'sourceIds'>,
+): Promise<IndexedCodeContextRow[]> {
+  const names = Array.from(new Set(symbols.filter(Boolean))).slice(0, INDEXED_HELPER_LIMIT);
+  if (names.length === 0) return [];
+  const params: unknown[] = [names];
+  let sourcePredicate = '';
+  // Same scalar-wins precedence as the gather streams (#4621): an explicit
+  // `sourceId` must not be widened by a federated `sourceIds` grant.
+  const { sourceId, sourceIds } = resolveThinkSourceScope(opts);
+  if (sourceIds && sourceIds.length > 0) {
+    params.push(sourceIds);
+    sourcePredicate = `AND p.source_id = ANY($${params.length}::text[])`;
+  } else if (sourceId) {
+    params.push(sourceId);
+    sourcePredicate = `AND p.source_id = $${params.length}`;
+  }
+  return engine.executeRaw<IndexedCodeContextRow>(
+    `SELECT p.slug, p.source_id, cc.symbol_name, cc.chunk_text,
+            cc.start_line, cc.end_line, (p.frontmatter->>'file') AS file
+       FROM content_chunks cc
+       JOIN pages p ON p.id = cc.page_id
+      WHERE cc.symbol_name = ANY($1::text[])
+        AND p.page_kind = 'code'
+        AND p.deleted_at IS NULL
+        ${sourcePredicate}
+      ORDER BY p.source_id, p.slug, cc.start_line
+      LIMIT ${INDEXED_HELPER_LIMIT}`,
+    params,
+  );
+}
 
 export interface ThinkGatherOpts {
   question: string;
@@ -52,6 +112,53 @@ export interface ThinkGatherOpts {
   sourceIds?: string[];
   /** System One S2: think's one precomputed search-intent answer, shared by the gather legs. */
   decideIntent?: IntentAsk;
+  /**
+   * Optional cleaned retrieval text, used as the SEARCH key while `question`
+   * is reserved for synthesis. Web Chat sends recent turns in here (with the
+   * live ask after a 当前问题： marker); searching the raw wrapper dilutes the
+   * lexical leg enough that an exact-title ask misses. Absent → the question
+   * is the key, i.e. the historical behavior.
+   */
+  retrievalQuery?: string;
+  /**
+   * Literal slug prefixes to enumerate deterministically. When set, the
+   * gather LISTs under these prefixes (slug-ordered, source-scoped) instead of
+   * ranking: a "what is in this folder" question wants the complete bounded
+   * set, and semantic ranking answers a different question. The listing is
+   * unioned with (and ranked ahead of) the hybrid hits.
+   */
+  slugPrefixes?: string[];
+}
+
+/**
+ * #4508/#4621 — resolve which source scope a think gather applies.
+ *
+ * Precedence is deliberately SCALAR WINS: the explicit per-call `sourceId` is
+ * the caller's request ("search THIS source") and must never be widened by a
+ * federated `sourceIds` grant. The web /think/stream route forwards BOTH an
+ * explicit `source_id` from the chat dropdown AND `authInfo.allowedSources`
+ * (a global-access OAuth client resolves that array to EVERY active source),
+ * so an array-wins ladder silently overrode the user's pick and answered from
+ * other sources.
+ *
+ * Single source of truth: every gather stream, the hydration sites and the
+ * trajectory lookup spread this fragment.
+ *
+ * Returns the SCOPE FRAGMENT the engine methods spread: scalar-only when the
+ * explicit pick exists, otherwise the federated array (or {}) — never both.
+ *
+ * Local port from the 0.48 development line; upstream 0.60 uses an array-wins
+ * ladder inline at each call site.
+ */
+export function resolveThinkSourceScope(opts: {
+  sourceId?: string;
+  sourceIds?: string[];
+}): { sourceId?: string; sourceIds?: string[] } {
+  return opts.sourceId !== undefined
+    ? { sourceId: opts.sourceId }
+    : opts.sourceIds && opts.sourceIds.length > 0
+      ? { sourceIds: opts.sourceIds }
+      : {};
 }
 
 export interface ThinkGatherResult {
@@ -77,6 +184,17 @@ export interface ThinkGatherResult {
     questionSanitizedFor: 'expansion' | 'none';
     window?: { dropped: number; undatedKept: number };
   };
+  /**
+   * Code-question extras (local port). Populated only when the question looks
+   * like a code ask and hybrid surfaced a plausible target file: hybrid search
+   * acts as a LOCATOR, and these are the full pages it pointed at, so a long
+   * source file is not crushed into one shared excerpt budget.
+   */
+  focusedPages?: Page[];
+  focusedContexts?: CodeContext[];
+  /** Called helpers resolved from the CODE INDEX (not from search ranking). */
+  indexedContexts?: CodeContext[];
+  codeFocus?: CodeFocus;
 }
 
 const RRF_K = 60;
@@ -127,11 +245,13 @@ export async function runGather(
   const gatherLimit = opts.gatherLimit ?? 40;
   const takesLimit = opts.takesLimit ?? 30;
   const graphDepth = opts.graphDepth ?? 2;
-  const sourceScope = opts.sourceIds && opts.sourceIds.length > 0
-    ? { sourceIds: opts.sourceIds }
-    : opts.sourceId
-      ? { sourceId: opts.sourceId }
-      : {};
+  // Local port (#4621): scalar-wins precedence. The explicit per-call
+  // `sourceId` is the caller's request ("search THIS source") and must never
+  // be widened by a federated `sourceIds` grant. The web /think/stream route
+  // forwards BOTH the chat dropdown's `source_id` AND `authInfo.allowedSources`
+  // (a global-access OAuth client resolves that array to EVERY active source),
+  // so array-wins made a user who picked one source search the whole brain.
+  const sourceScope = resolveThinkSourceScope(opts);
   const pageScope = { ...sourceScope, excludePrivate: opts.excludePrivate, requireSafeChunks: opts.remote !== false, takesHoldersAllowList: opts.takesHoldersAllowList };
   // System One: gather searches run S3/S5 under call site `think` (remote spend counted as remote).
   const decide = { remote: opts.remote !== false, callSite: 'think', ...(opts.decideIntent ? { intent: opts.decideIntent } : {}) };
@@ -140,6 +260,17 @@ export async function runGather(
   // Sanitize the question for any path that includes it in an LLM prompt.
   // (Direct DB search is fine — those are parameterized queries.)
   const sanitizedQuestion = sanitizeQueryForPrompt(opts.question);
+
+  // Retrieval key ≠ synthesis question. Web Chat sends the recent turns inside
+  // `retrievalQuery` (and wraps the live ask in a 当前问题： marker); feeding
+  // that whole string to hybridSearch dilutes the lexical leg so an exact-title
+  // ask misses. `cleanThinkRetrievalQuery` strips the wrappers and the
+  // answer-intent prefixes ("总结一下 ", "please summarize ") for SEARCH ONLY —
+  // synthesis still receives the untouched question below.
+  const retrievalQuestion = cleanThinkRetrievalQuery(opts.retrievalQuery?.trim() || opts.question);
+  // Classify once: the code-focus extras below and the renderer both branch on
+  // this, and detectCodeFocus does regex work over the question.
+  const codeFocus = detectCodeFocus(opts.question);
 
   const warnings: string[] = [];
   const window = opts.window;
@@ -161,7 +292,7 @@ export async function runGather(
   // sized for breadth (default 40) could collapse to 1-6 pages and starve
   // synthesis. Precision trimming is the synth prompt's job here.
   const pagesPromise = (window ? Promise.all([
-    hybridSearch(engine, opts.question, {
+    hybridSearch(engine, retrievalQuestion, {
       limit: Math.min(gatherLimit * 4, 200),
       expansion: false,
       ...INTERNAL_BREADTH_SEARCH_OPTS,
@@ -183,7 +314,7 @@ export async function runGather(
     const filtered = filterPagesToWindow(combined, window);
     windowDiagnostic = { dropped: filtered.droppedOutOfWindow, undatedKept: filtered.undatedKept };
     return filtered.kept.slice(0, gatherLimit);
-  }) : hybridSearch(engine, opts.question, {
+  }) : hybridSearch(engine, retrievalQuestion, {
     limit: gatherLimit,
     expansion: false,
     ...INTERNAL_BREADTH_SEARCH_OPTS,
@@ -194,6 +325,25 @@ export async function runGather(
     process.stderr.write(`[think.gather] hybrid stream failed: ${(e as Error).message}\n`);
     return [] as SearchResult[];
   });
+
+  // Stream 1b (local port): deterministic prefix enumeration. A directory
+  // question wants the complete bounded set under a literal prefix — ranked
+  // semantic hits answer a different question and, on a large brain, bury the
+  // folder's own pages. The listing is slug-ordered and source-scoped, deduped
+  // per (source_id, slug), and ranked AHEAD of hybrid (it is the answer, not a
+  // candidate). Absent prefixes → the array is empty and nothing changes.
+  const prefixPagesPromise: Promise<SearchResult[]> = (opts.slugPrefixes && opts.slugPrefixes.length > 0)
+    ? Promise.all(opts.slugPrefixes.map((slugPrefix) =>
+        engine.listPages({ slugPrefix, limit: Math.min(gatherLimit, 100), sort: 'slug', ...pageScope })
+          .then(pageList => pageList.map(toSearchResult))
+          .catch((e) => {
+            warnings.push('GATHER_PREFIX_ENUMERATION_FAILED');
+            process.stderr.write(`[think.gather] prefix enumeration failed: ${(e as Error).message}\n`);
+            return [] as SearchResult[];
+          }),
+      )).then(groups => groups.flat().filter((page, index, all) =>
+        all.findIndex((candidate) => candidate.source_id === page.source_id && candidate.slug === page.slug) === index))
+    : Promise.resolve([] as SearchResult[]);
 
   // Stream 2: keyword search across takes.
   const takesKwPromise = engine.searchTakes(opts.question, {
@@ -252,13 +402,31 @@ export async function runGather(
       })
     : Promise.resolve(null);
 
-  const [pages, takesKw, takesVec, graphSlugs, anchorPage] = await Promise.all([
-    pagesPromise, takesKwPromise, takesVecPromise, graphPromise, anchorPagePromise,
+  const [hybridPages, takesKw, takesVec, graphSlugs, anchorPage, prefixPages] = await Promise.all([
+    pagesPromise, takesKwPromise, takesVecPromise, graphPromise, anchorPagePromise, prefixPagesPromise,
   ]);
 
-  // Diagnostics honesty: count hybrid's own hits BEFORE the synthetic
-  // anchor row is (possibly) unshifted below.
-  const pagesFromHybrid = pages.length;
+  // Diagnostics honesty: count hybrid's own hits BEFORE any merge, so a
+  // directory listing can never be reported as retrieval quality.
+  const pagesFromHybrid = hybridPages.length;
+  const pages: SearchResult[] = prefixPages.length === 0
+    ? hybridPages
+    : [...prefixPages, ...hybridPages.filter((p) => !prefixPages.some(k => k.source_id === p.source_id && k.slug === p.slug))];
+
+  // Action-wrapped exact titles score poorly in semantic retrieval ("总结一下
+  // X" against a page titled X). Recover deterministically through the existing
+  // title index before giving up — this changes retrieval, never the user's
+  // wording (synthesis still gets opts.question). Only runs when cleaning
+  // actually changed the key, so a plain ask keeps its original ranking.
+  if (pageScope && retrievalQuestion !== opts.question && pages.length === 0 && !opts.anchor) {
+    const titleHits = await engine.searchTitles(retrievalQuestion, { limit: Math.min(gatherLimit, 20), ...pageScope })
+      .catch(() => [] as SearchResult[]);
+    const exact = titleHits.filter((page) => isExactTitleMatch(page.title, retrievalQuestion));
+    if (exact.length > 0) {
+      pages.push(...exact);
+      warnings.push('THINK_TITLE_LOOKUP_APPLIED');
+    }
+  }
 
   if (opts.anchor && !anchorPage && !anchorHydrateFailed) {
     // The anchor slug resolves to no page (typo, wrong source scope, or
@@ -290,11 +458,58 @@ export async function runGather(
     (h: TakeHit) => `${h.page_slug}#${h.row_num}`,
   ).slice(0, takesLimit);
 
+  // Code questions use hybrid search only as a LOCATOR. Hydrate at most two
+  // explicit target pages with the same source scope so long code files are
+  // not reduced to one shared excerpt budget across every hit.
+  const focusedHits = codeFocus.isCodeQuestion ? selectCodeFocusHits(pages, codeFocus, 2) : [];
+  const focusedPages = focusedHits.length > 0
+    ? (await Promise.all(focusedHits.map((hit) => engine.getPage(hit.slug, resolveThinkSourceScope(opts))))).filter((page): page is Page => page !== null)
+    : [];
+  const seenFocused = new Set<string>();
+  const uniqueFocusedPages = focusedPages.filter((page) => {
+    const key = codeFocusKey(page);
+    if (seenFocused.has(key)) return false;
+    seenFocused.add(key);
+    return true;
+  });
+  const focusedContexts = uniqueFocusedPages.flatMap((page) => {
+    const content = page.compiled_truth ?? '';
+    const roots = extractCodeContexts(content, codeFocus.symbols);
+    const helpers = expandLocalHelperContexts(content, roots, 2, 6, 12);
+    return [...roots, ...helpers].map((context) => ({ ...context, pageKey: codeFocusKey(page) }));
+  });
+  const focusedSymbols = new Set(focusedContexts.map((context) => context.symbol).filter((symbol): symbol is string => Boolean(symbol)));
+  const candidateHelperSymbols = focusedContexts
+    .filter((context) => context.kind === 'function')
+    .flatMap((context) => extractCalledSymbols(context))
+    .filter((symbol) => !focusedSymbols.has(symbol));
+  const indexedRows = codeFocus.isCodeQuestion
+    ? await findIndexedCodeHelpers(engine, candidateHelperSymbols, opts)
+    : [];
+  const indexedContexts: CodeContext[] = indexedRows
+    .filter((row) => !focusedSymbols.has(row.symbol_name))
+    .map((row) => ({
+      symbol: row.symbol_name,
+      rootSymbol: null,
+      relation: 'indexed-helper' as const,
+      depth: 2,
+      kind: 'function' as const,
+      text: row.chunk_text,
+      startLine: row.start_line ?? 1,
+      endLine: row.end_line ?? row.start_line ?? 1,
+      truncated: false,
+      pageKey: `${row.source_id}:${row.slug}`,
+    }));
+
   return {
     pages: pages.slice(0, gatherLimit),
     takes: fusedTakes,
     graphSlugs,
     warnings,
+    focusedPages: uniqueFocusedPages,
+    focusedContexts,
+    indexedContexts,
+    ...(codeFocus.isCodeQuestion ? { codeFocus } : {}),
     diagnostics: {
       pagesFromHybrid,
       takesFromKeyword: takesKw.length,
@@ -677,6 +892,151 @@ export function renderPagesBlockDetailed(
     return `<page slug="${slug}" rank="${idx + 1}"${dateAttr}${trustAttr}>\n${flag}${body}\n</page>`;
   }).join('\n\n');
   return { text, truncated };
+}
+
+export function renderPagesBlock(
+  pages: SearchResult[],
+  excerptLen = 600,
+  query = '',
+): string {
+  return pages.map((p, idx) => {
+    const page = p as unknown as {
+      slug?: string;
+      title?: string;
+      compiled_truth?: string;
+      chunk_text?: string;
+      snippet?: string;
+    };
+    const slug = String(page.slug ?? '');
+    const title = String(page.title ?? '');
+    const slugIdentity = slug.split('/').pop()?.replace(/[-_]/g, ' ') ?? '';
+    const content = String(page.chunk_text ?? '');
+    const excerpt = selectRelevantExcerptDetailed(
+      content,
+      query,
+      excerptLen,
+      `${title} ${slugIdentity}`,
+    );
+    const body =
+      (excerpt.truncatedStart ? `${EXCERPT_CUT_START_MARKER}\n` : '') +
+      excerpt.text +
+      (excerpt.truncatedEnd ? `\n${EXCERPT_CUT_END_MARKER}` : '');
+    return `<page slug="${slug}" rank="${idx + 1}">\n${body}\n</page>`;
+  }).join('\n\n');
+}
+
+const CODE_PRIMARY_PAGE_MAX_CHARS = 12_000;
+const CODE_SUPPORTING_PAGE_MAX_CHARS = 1_200;
+const CODE_SUPPORTING_PAGE_LIMIT = 3;
+const CODE_TOTAL_BUDGET_CHARS = 30_000;
+const PREFIX_TOTAL_BUDGET_CHARS = 24_000;
+const PREFIX_PAGE_MAX_CHARS = 6_000;
+
+/** Render deterministic slug-prefix results without semantic-search excerpts. */
+export function renderPrefixEnumerationBlock(
+  pages: SearchResult[],
+  prefix: string,
+  opts: { overview?: boolean } = {},
+): string {
+  const totalBudget = opts.overview ? PREFIX_OVERVIEW_TOTAL_BUDGET_CHARS : PREFIX_TOTAL_BUDGET_CHARS;
+  const pageMax = opts.overview ? PREFIX_OVERVIEW_PAGE_MAX_CHARS : PREFIX_PAGE_MAX_CHARS;
+  let used = 0;
+  return pages.flatMap((page) => {
+    if (used >= totalBudget) return [];
+    const raw = String((page as unknown as { chunk_text?: unknown }).chunk_text ?? '');
+    const remaining = Math.min(pageMax, totalBudget - used);
+    const text = ensureWellFormed(raw.slice(0, remaining));
+    used += text.length;
+    const truncated = text.length < raw.length;
+    return [`<enumeration-page slug="${page.slug}" prefix="${prefix}"${truncated ? ' truncated="true"' : ''}>\n${text}\n</enumeration-page>`];
+  }).join('\n\n');
+}
+
+function codePageBody(page: Page, maxChars: number): { text: string; truncated: boolean } {
+  const content = page.compiled_truth ?? '';
+  if (content.length <= maxChars) return { text: ensureWellFormed(content), truncated: false };
+  const excerpt = excerptWindow(content, 0, maxChars);
+  return { text: excerpt.text, truncated: true };
+}
+
+/**
+ * Render code evidence with hydrated target pages first. The locator hits stay
+ * as short supporting evidence; only explicit/strong code targets get a large
+ * context allocation. This keeps ordinary think prompts unchanged.
+ */
+export function renderCodeFocusedPagesBlock(
+  focusedPages: Page[],
+  focusedContexts: CodeContext[],
+  indexedContexts: CodeContext[],
+  locatorPages: SearchResult[],
+  query: string,
+): string {
+  const blocks: string[] = [];
+  let used = 0;
+  const focusedKeys = new Set(focusedPages.map((page) => codeFocusKey(page)));
+  const allContexts = [...focusedContexts, ...indexedContexts];
+
+  for (let pageIndex = 0; pageIndex < focusedPages.length; pageIndex += 1) {
+    const page = focusedPages[pageIndex];
+    const remaining = CODE_TOTAL_BUDGET_CHARS - used;
+    if (remaining <= 0) break;
+    const pageKey = codeFocusKey(page);
+    const pageContexts = allContexts
+      .filter((context) => context.pageKey === pageKey)
+      .sort((a, b) => (a.relation === 'requested' ? -2 : a.relation === 'direct-helper' ? -1 : 0) - (b.relation === 'requested' ? -2 : b.relation === 'direct-helper' ? -1 : 0));
+    const contextText = pageContexts.map((context) => {
+      const lineRange = `lines ${context.startLine}-${context.endLine}`;
+      const relation = context.relation ?? 'requested';
+      return `<code-context kind="${context.kind}" relation="${relation}"${context.symbol ? ` symbol="${context.symbol}"` : ''}${context.rootSymbol ? ` root="${context.rootSymbol}"` : ''} range="${lineRange}">\n${context.text}${context.truncated ? `\n${EXCERPT_CUT_END_MARKER}` : ''}\n</code-context>`;
+    }).join('\n\n');
+    const body = pageContexts.length > 0
+      ? { text: contextText, truncated: pageContexts.some((context) => context.truncated) }
+      : codePageBody(page, Math.min(CODE_PRIMARY_PAGE_MAX_CHARS, remaining));
+    const sourcePath = typeof page.frontmatter?.file === 'string' ? page.frontmatter.file : undefined;
+    const attrs = [
+      `slug="${page.slug}"`,
+      'primary="true"',
+      ...(sourcePath ? [`path="${sourcePath}"`] : []),
+    ].join(' ');
+    blocks.push(`<code-page ${attrs}>\n${body.text}\n</code-page>`);
+    used += body.text.length;
+  }
+
+  const indexedGroups = new Map<string, CodeContext[]>();
+  for (const context of indexedContexts) {
+    const group = indexedGroups.get(context.pageKey ?? 'indexed') ?? [];
+    group.push(context);
+    indexedGroups.set(context.pageKey ?? 'indexed', group);
+  }
+  for (const [pageKey, contexts] of indexedGroups) {
+    if (used >= CODE_TOTAL_BUDGET_CHARS) break;
+    const body = contexts.map((context) => {
+      const lineRange = `lines ${context.startLine}-${context.endLine}`;
+      return `<code-context kind="${context.kind}" relation="indexed-helper"${context.symbol ? ` symbol="${context.symbol}"` : ''} range="${lineRange}">\n${context.text}\n</code-context>`;
+    }).join('\n\n');
+    const slug = pageKey.includes(':') ? pageKey.slice(pageKey.indexOf(':') + 1) : pageKey;
+    blocks.push(`<code-page slug="${slug}" primary="true" indexed="true">\n${body}\n</code-page>`);
+    used += body.length;
+  }
+
+  let supportCount = 0;
+  for (const result of locatorPages) {
+    if (supportCount >= CODE_SUPPORTING_PAGE_LIMIT || used >= CODE_TOTAL_BUDGET_CHARS) break;
+    const key = `${result.source_id ?? 'default'}:${result.slug}`;
+    if (focusedKeys.has(key)) continue;
+    const excerpt = selectRelevantExcerptDetailed(
+      String(result.chunk_text ?? ''), query, Math.min(CODE_SUPPORTING_PAGE_MAX_CHARS, CODE_TOTAL_BUDGET_CHARS - used),
+      `${result.title ?? ''} ${result.slug ?? ''}`,
+    );
+    const body = (excerpt.truncatedStart ? `${EXCERPT_CUT_START_MARKER}\n` : '')
+      + excerpt.text
+      + (excerpt.truncatedEnd ? `\n${EXCERPT_CUT_END_MARKER}` : '');
+    blocks.push(`<code-page slug="${result.slug}" primary="false" rank="${supportCount + 1}">\n${body}\n</code-page>`);
+    used += body.length;
+    supportCount += 1;
+  }
+
+  return blocks.join('\n\n');
 }
 
 /** One line naming the typed links that put a chain row in the context (slugs and link types only). */

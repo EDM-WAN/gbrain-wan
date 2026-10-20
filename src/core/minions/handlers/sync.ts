@@ -80,14 +80,38 @@ export function makeSyncHandler(engine: BrainEngine): MinionHandler {
     // aborts only the worker's shutdown signal, so the sync and its git pull stop on either signal.
     const { composeAbortSignals } = await import('../../sync-reconcile.ts');
     const signal = composeAbortSignals(job.signal, job.shutdownSignal);
+    // Local port (0.48 plan D): gbrain-web's SDK indexing submits this job with
+    // {strategy:'auto', full:true}. Without forwarding them performSync falls
+    // back to the default markdown strategy, SDK source files are skipped and
+    // the code call graph comes back empty. Whitelist only the three strategies
+    // the sync CLI knows; anything else is silently ignored (handler default).
+    const strategyArg =
+      typeof job.data.strategy === 'string' &&
+      ['markdown', 'code', 'auto'].includes(job.data.strategy)
+        ? job.data.strategy as 'markdown' | 'code' | 'auto'
+        : undefined;
+    let bankedTotal = 0;
     let result;
     try {
       result = await performSync(engine, {
         repoPath, sourceId, noPull, noEmbed, noExtract, signal,
         explicitProcessing: explicitSyncProcessing(job.data),
         concurrency: concurrencyOverride,
+        ...(strategyArg ? { strategy: strategyArg } : {}),
+        ...(job.data.full === true ? { full: true } : {}),
         ...(githubItem ? { githubItem } : {}),
+        // Plan D: report file-level progress (the import phase's cumulative
+        // bankedFiles) so the console can poll "N of M files processed".
+        onProgress: (p) => {
+          if (p.phase === 'import' && typeof p.bankedFiles === 'number') {
+            bankedTotal = Math.max(bankedTotal, p.bankedFiles);
+            job.updateProgress({ done: p.bankedFiles, phase: 'import.files' }).catch(() => {});
+          }
+        },
       });
+      if (bankedTotal > 0) {
+        job.updateProgress({ done: bankedTotal, phase: 'import.files' }).catch(() => {});
+      }
     } catch (err) {
       // v0.42.x (#1794, Part B): single-flight backpressure. A concurrent
       // sync (manual run, sibling autopilot tick) holds the per-source lock.

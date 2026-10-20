@@ -68,6 +68,10 @@ import {
   type WireSyncResult,
 } from '../core/context/sync-ipc.ts';
 import { OperationError } from '../core/ops/contract.ts';
+// Plan D: the delegated ladder validates --workers/--concurrency with the SAME
+// helper the local sync path uses, so a value accepted locally can never be
+// rejected (or silently reinterpreted) when the run is delegated.
+import { parseWorkers } from '../core/sync-concurrency.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import type { ConsumerRow } from '../core/persistence/consumer-heartbeat.ts';
 import type { SyncOpts, SyncResult } from './sync.ts';
@@ -100,8 +104,8 @@ export const WIRE_BOOL_FLAGS: Record<string, keyof DelegatedSyncOptions> = {
   '--include-gitignored': 'includeGitignored',
   '--no-bulk': 'noBulk',
 };
-/** Value-taking flags the ladder consumes itself (`--lanes` is validated and forwarded; the deadlines are derived). */
-export const VALUE_FLAGS = new Set(['--source', '--timeout', '--hard-deadline', '--lanes']);
+/** Value-taking flags the ladder consumes itself (`--lanes`/`--strategy`/`--workers` are validated and forwarded; the deadlines are derived). */
+export const VALUE_FLAGS = new Set(['--source', '--timeout', '--hard-deadline', '--lanes', '--strategy', '--workers', '--concurrency']);
 /** Flags that are meaningful only outside delegation, handled pre-ladder, or rendered by this client (`--json`). */
 export const IGNORED_FLAGS = new Set(['--yes', '--no-delegate', '--no-hard-deadline', '--json']);
 /** `--no-lanes` is `--lanes 1` (`src/commands/sync/args.ts`). */
@@ -137,6 +141,20 @@ export function parseDelegatedSyncArgs(args: string[]): ParsedDelegatedArgs {
         const lanes = Number(v);
         if (!Number.isInteger(lanes) || lanes < 1 || lanes > DELEGATED_SYNC_LANES_MAX) return { ok: false, refused: `${tok} (invalid value)` };
         options.lanes = lanes;
+      }
+      if (tok === '--strategy') {
+        // SyncOpts['strategy'] — same three lanes the local sync accepts.
+        if (!['markdown', 'code', 'auto'].includes(v)) return { ok: false, refused: `${tok} (invalid value)` };
+        options.strategy = v;
+      }
+      if (tok === '--workers' || tok === '--concurrency') {
+        // parseWorkers throws on '0'/'-3'/'foo'/'1.5'; a bad value must refuse
+        // the delegation ladder, not fall through to an auto-concurrency run.
+        try {
+          options.concurrency = parseWorkers(v);
+        } catch {
+          return { ok: false, refused: `${tok} (invalid value)` };
+        }
       }
       i++; // --timeout / --hard-deadline are consumed by the deadline derivation
       continue;

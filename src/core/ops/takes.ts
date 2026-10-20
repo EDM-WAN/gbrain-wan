@@ -15,6 +15,8 @@ import {
   readPolicyOpts,
   readHolders,
   thinkSourceScopeOpts,
+  parseSourceIdParam,
+  resolveRequestedScope,
   enforceClientSlugFence,
   validatePageSlug,
 } from './context.ts';
@@ -262,6 +264,10 @@ const think: Operation = {
     model: { type: 'string', description: 'Model override (alias or full id). Falls through models.think → models.default → GBRAIN_MODEL → opus.' },
     since: { type: 'string', description: 'Start of temporal window (YYYY-MM-DD or YYYY-MM). Omit both bounds and a question naming one explicit date (2026-09-15, 2026-09, September 2026) is bounded to it; the result says window_source.' },
     until: { type: 'string', description: 'End of temporal window' },
+    source_id: { type: 'string', description: "Scope synthesis retrieval to one source. Explicit source IDs must be granted; '__all__' spans the caller's granted sources remotely." },
+    slug_prefix: { type: 'string', description: 'Literal page-slug prefix for deterministic file enumeration, for example wiki/error-.' },
+    retrieval_query: { type: 'string', description: 'Optional cleaned retrieval text; kept separate from the user question used for synthesis.' },
+    conversation_context: { type: 'string', description: 'Optional recent conversation context for synthesis only; never used to widen retrieval scope.' },
     reference_date: { type: 'string', description: 'YYYY-MM-DD the question\'s relative time words resolve against (default: today in brain.timezone).' },
   },
   // Local CLI can persist with save/take; remote/MCP callers are forced
@@ -277,10 +283,23 @@ const think: Operation = {
     // present) OR the scalar; we pass both through to runThink which
     // forwards to findTrajectory. CLI callers don't go through this op
     // and get default scope + remote=false from runThink's CLI path.
-    const thinkScope = thinkSourceScopeOpts(ctx);
+    // Plan D: an explicit per-call source_id wins over the ctx-derived scope,
+    // same contract as search/query/list_pages (parseSourceIdParam rejects
+    // malformed ids loudly; resolveRequestedScope is fail-closed for remote
+    // callers naming a source outside their grant).
+    const thinkSourceId = parseSourceIdParam(p.source_id, 'think', { allowAll: true });
+    const thinkScope = thinkSourceId !== undefined
+      ? resolveRequestedScope(ctx, thinkSourceId)
+      : thinkSourceScopeOpts(ctx);
     const { runThink, persistSynthesis } = await import('../think/index.ts');
     const result = await runThink(ctx.engine, {
       question: String(p.question),
+      // Plan D: retrieval text, file-prefix enumeration and synthesis-only
+      // conversation context are threaded separately from `question` so the
+      // caller can steer retrieval without changing what is answered.
+      retrievalQuery: typeof p.retrieval_query === 'string' ? p.retrieval_query.trim() || undefined : undefined,
+      conversationContext: typeof p.conversation_context === 'string' ? p.conversation_context : undefined,
+      slugPrefix: typeof p.slug_prefix === 'string' ? p.slug_prefix.trim() || undefined : undefined,
       // #3734: MCP think must populate the question vector for takes retrieval.
       embedQuestion: (q) => embedQuery(q),
       anchor: p.anchor ? String(p.anchor) : undefined,

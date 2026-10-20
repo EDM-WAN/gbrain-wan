@@ -144,6 +144,117 @@ const code_def: Operation = {
   cliHints: { name: 'code_def', hidden: true },
 };
 
+// --- Local port: code call graph for the web Knowledge Graph page ---
+// Upstream 0.60 has no `code_graph` op. Unlike the suspended `codeReadOperations`
+// below, this one keeps the remote read path: it returns only structural
+// metadata (symbol names, file paths, line numbers, edge type) and never raw
+// code fragments, so it is safe for the same federated callers that serve the
+// page's symbol list. It routes its scope through `routeCodeIntelScope` exactly
+// like its siblings.
+const code_graph: Operation = {
+  name: 'code_graph',
+  description: 'Build a bounded source-scoped code call graph from indexed symbols and edges. Nodes are functions/classes/types and edges are calls, imports, or references. Use source_id for one repository; unresolved symbol targets are included as unresolved nodes.',
+  params: {
+    limit: { type: 'number', description: 'Maximum edge rows. Default 300, max 500.' },
+    source_id: { type: 'string', description: "Scope to one source. Defaults to the caller grant; '__all__' spans granted sources for remote callers." },
+    all_sources: { type: 'boolean', description: 'Span all granted sources.' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    const { allSources, sourceId } = await routeCodeIntelScope(
+      ctx,
+      typeof p.source_id === 'string' ? p.source_id : undefined,
+      p.all_sources === true,
+      'code_graph',
+    );
+    const rawLimit = typeof p.limit === 'number' && Number.isFinite(p.limit) ? Math.floor(p.limit) : 300;
+    const limit = Math.max(1, Math.min(rawLimit, 500));
+    const params: unknown[] = [];
+    const sourcePredicate = allSources || !sourceId
+      ? ''
+      : (() => {
+          params.push(sourceId);
+          return `AND e.source_id = $${params.length}`;
+        })();
+    params.push(limit);
+    const rows = await ctx.engine.executeRaw<{
+      from_symbol: string; from_type: string | null; from_slug: string; from_title: string;
+      from_file: string | null; from_start: number | null; from_end: number | null; from_source: string;
+      to_symbol: string; to_type: string | null; to_slug: string | null; to_title: string | null;
+      to_file: string | null; to_start: number | null; to_end: number | null; to_source: string | null;
+      edge_type: string; resolved: boolean; resolution_kind: string | null;
+    }>(
+      `SELECT
+         e.from_symbol_qualified AS from_symbol,
+         fc.symbol_type AS from_type,
+         fp.slug AS from_slug, fp.title AS from_title,
+         fp.frontmatter->>'file' AS from_file,
+         fc.start_line AS from_start, fc.end_line AS from_end,
+         fp.source_id AS from_source,
+         e.to_symbol_qualified AS to_symbol,
+         tc.symbol_type AS to_type,
+         tp.slug AS to_slug, tp.title AS to_title,
+         tp.frontmatter->>'file' AS to_file,
+         tc.start_line AS to_start, tc.end_line AS to_end,
+         tp.source_id AS to_source,
+         e.edge_type,
+         COALESCE(e.to_chunk_id, (e.edge_metadata->>'resolved_chunk_id')::int) IS NOT NULL AS resolved,
+         CASE
+           WHEN e.to_chunk_id IS NOT NULL THEN 'resolved'
+           WHEN e.edge_metadata->>'resolved_chunk_id' IS NOT NULL THEN 'resolved_metadata'
+           WHEN e.edge_metadata->>'ambiguous' = 'true' THEN 'ambiguous'
+           ELSE 'unresolved'
+         END AS resolution_kind
+       FROM (
+         SELECT from_chunk_id, to_chunk_id, from_symbol_qualified, to_symbol_qualified, edge_type, source_id, edge_metadata
+           FROM code_edges_chunk
+         UNION ALL
+         -- An unresolved edge may have been bound later by the edges-backfill
+         -- pass through edge_metadata.resolved_chunk_id (its own to_chunk_id
+         -- stays NULL, since code_edges_symbol has no such column). Carry that
+         -- metadata through the LEFT JOIN below, or an edge that HAS resolved
+         -- would still be reported as an unresolved node.
+         SELECT from_chunk_id, NULL::int AS to_chunk_id, from_symbol_qualified, to_symbol_qualified, edge_type, source_id, edge_metadata
+           FROM code_edges_symbol
+       ) e
+       JOIN content_chunks fc ON fc.id = e.from_chunk_id
+       JOIN pages fp ON fp.id = fc.page_id AND fp.deleted_at IS NULL AND fp.page_kind = 'code'
+       LEFT JOIN content_chunks tc ON tc.id = COALESCE(e.to_chunk_id, (e.edge_metadata->>'resolved_chunk_id')::int)
+       LEFT JOIN pages tp ON tp.id = tc.page_id AND tp.deleted_at IS NULL AND tp.page_kind = 'code'
+       WHERE 1=1 ${sourcePredicate}
+       ORDER BY fp.source_id, fp.slug, fc.start_line NULLS LAST, e.to_symbol_qualified
+       LIMIT $${params.length}`,
+      params,
+    );
+
+    const nodes = new Map<string, Record<string, unknown>>();
+    const edges: Record<string, unknown>[] = [];
+    for (const row of rows) {
+      const fromId = `${row.from_source}:${row.from_symbol}`;
+      const targetSource = row.to_source ?? row.from_source;
+      const toId = row.to_slug && row.to_type
+        ? `${targetSource}:${row.to_slug}:${row.to_symbol}`
+        : `${targetSource}:unresolved:${row.to_symbol}`;
+      nodes.set(fromId, {
+        id: fromId, slug: fromId, symbol: row.from_symbol,
+        title: row.from_symbol, type: row.from_type ?? 'symbol',
+        file: row.from_file, page_slug: row.from_slug,
+        source_id: row.from_source, start_line: row.from_start, end_line: row.from_end, weight: 1,
+      });
+      nodes.set(toId, {
+        id: toId, slug: toId, symbol: row.to_symbol,
+        title: row.to_symbol, type: row.to_type ?? 'unresolved',
+        file: row.to_file, page_slug: row.to_slug ?? undefined,
+        source_id: targetSource, start_line: row.to_start, end_line: row.to_end, weight: 1,
+        ...(row.resolution_kind ? { resolution_kind: row.resolution_kind } : {}),
+      });
+      edges.push({ source: fromId, target: toId, type: row.edge_type, weight: 1, resolved: row.resolved, resolution_kind: row.resolution_kind });
+    }
+    return { nodes: Array.from(nodes.values()), edges, edge_count: edges.length, node_count: nodes.size, source_id: allSources ? null : sourceId ?? null };
+  },
+  cliHints: { name: 'code_graph', hidden: true },
+};
+
 const code_refs: Operation = {
   name: 'code_refs',
   mutating: false,
@@ -348,4 +459,9 @@ export const codeIntelOperations: Operation[] = [
     },
   })),
   code_traversal_cache_clear,
+  // Local port: registered OUTSIDE the suspension map — the web Knowledge
+  // Graph reads it through the HTTP MCP surface. It exposes structural
+  // metadata only (symbol, file, line, edge type), never code text, and its
+  // scope routes through routeCodeIntelScope like the suspended siblings.
+  code_graph,
 ];

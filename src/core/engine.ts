@@ -1031,6 +1031,14 @@ export interface BrainEngine {
    */
   listPages(filters?: PageFilters): Promise<Page[]>;
   /**
+   * v0.51.x — count pages matching the SAME predicates as `listPages`
+   * (both go through the identical WHERE builder, so list/count never drift).
+   * Used by `list_pages include_total` so a paginated consumer (the web
+   * Memory Library) learns the full total from one COUNT instead of probing.
+   * `limit`/`offset`/`sort` are ignored.
+   */
+  listPagesCount(filters?: PageFilters): Promise<number>;
+  /**
    * Fuzzy slug resolver.
    *
    * v0.41.13 (#1436): `opts.sourceId` scopes the search to a single source;

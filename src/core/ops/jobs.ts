@@ -147,6 +147,7 @@ const submit_job: Operation = {
     delay: { type: 'number', description: 'Delay in ms before eligible' },
     timeout_ms: { type: 'number', description: 'Per-job wall-clock timeout in ms; aborted job goes to dead' },
     lock_duration_ms: { type: 'number', description: 'Per-job lock lease in ms (#4145). Out-of-range values are clamped to [5000, 3600000] — remote writers cannot pin an immortal lock. Omit to use the handler-type default (300s for long LLM handlers) or the worker default (30s).' },
+    idempotency_key: { type: 'string', description: 'Optional caller-owned key; a repeated submit with the same key returns the existing job instead of enqueuing a duplicate.' },
   },
   mutating: true,
   scope: 'admin',
@@ -221,6 +222,9 @@ const submit_job: Operation = {
           // clampLockDurationMs (ParamDef has no min/max support; wrong TYPE is
           // rejected by the shared number validation upstream of this handler).
           lock_duration_ms: (p.lock_duration_ms as number) || undefined,
+          // A repeated submit with the same key returns the existing job
+          // (dedupe is queue.add's; the op only forwards the caller's key).
+          idempotency_key: typeof p.idempotency_key === 'string' ? p.idempotency_key : undefined,
         }, trusted);
       } catch (e) {
         return translateAdmissionError(e);

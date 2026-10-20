@@ -142,7 +142,10 @@ import G_ZIG from '../../assets/wasm/grammars/tree-sitter-zig.wasm' with { type:
 // previously-merged file, so the bump forces a re-chunk that recovers the
 // erased symbols.
 // v8 (N13-1): `const f = () => …` definitions keep their own named chunk.
-export const CHUNKER_VERSION = 8;
+// v9: 覆盖率兜底 —— tree-sitter 对「整文件被 #ifdef 包裹」的 C 源码只解析出头部
+// `#include`，余下上千行静默丢失（chunk 覆盖不足）。现在覆盖不到 50% 时回退到
+// 递归分片。分片结果对这类文件完全不同，bump 让存量页面在下一次 sync 时重切。
+export const CHUNKER_VERSION = 9;
 /**
  * Per-language chunker revisions (a grammar swap or a language-specific emission rule), folded into that language's
  * code-file hash and into `chunkerStamp()`: a change re-chunks only its own language's files instead of every code
@@ -576,8 +579,8 @@ export function detectCodeLanguage(filePath: string, content?: string): Supporte
   if (lower.endsWith('.rs')) return 'rust';
   if (lower.endsWith('.java')) return 'java';
   if (lower.endsWith('.cs')) return 'c_sharp';
-  if (lower.endsWith('.cpp') || lower.endsWith('.cc') || lower.endsWith('.cxx') || lower.endsWith('.hpp') || lower.endsWith('.hxx') || lower.endsWith('.hh')) return 'cpp';
-  if (lower.endsWith('.c') || lower.endsWith('.h')) return 'c';
+  if (lower.endsWith('.c++') || lower.endsWith('.cpp') || lower.endsWith('.cc') || lower.endsWith('.cxx') || lower.endsWith('.hpp') || lower.endsWith('.hxx') || lower.endsWith('.hh')) return 'cpp';
+  if (lower.endsWith('.xc') || lower.endsWith('.c') || lower.endsWith('.h')) return 'c';
   if (lower.endsWith('.php')) return 'php';
   if (lower.endsWith('.swift')) return 'swift';
   if (lower.endsWith('.kt') || lower.endsWith('.kts')) return 'kotlin';
@@ -912,6 +915,33 @@ async function chunkParsedLanguage(
     if (chunks.length === 0) {
       return { chunks: fallbackChunks(source, filePath, language, opts), edges: rawEdges };
     }
+
+    // 覆盖率兜底：tree-sitter 遇到预处理条件块（`#if defined(CONFIG_X)` 包住
+    // 大段代码）或语法歧义时，只把其中一部分当顶层语义节点，其余内容静默丢失
+    // —— 索引看起来「成功」，实际检索不到。两种典型形态：
+    //   ① 只切了文件头部，剩余上千行全丢（rtk_coex.c: 1 chunk / 1285 行）
+    //   ② 切出很多 chunk，但 chunk 之间有空隙（stb_image.h: 49 chunks 只覆盖 6.5%）
+    // 形态 ② 用「最后一个 chunk 的行号」判不出来（末尾那块确实存在），所以这里
+    // 直接比较**内容字符总数**：切出来的总量不到原文一半，就认定 AST 不完整。
+    //
+    // 用字符而非行号，是因为 fallback chunk 的 endLine 是块内相对行号，
+    // 跨块不可比；字符数则是线性可加的绝对量。
+    if (source.length > 1000) {
+      // 必须剔除 chunk 头部（`[C] path:N-M symbol`）再比较：头部是为 embedding
+      // 补的上下文，不是文件内容，且长度随路径变化 —— 路径越长，头部越多，
+      // 覆盖率被虚高，短文件路径下会漏判（实测同一文件：短路径 48.2% 触发回退，
+      // 长路径 52.7% 不触发）。
+      const coveredChars = chunks.reduce((sum, c) => sum + stripChunkHeader(c.text).length, 0);
+      if (coveredChars < source.length * 0.5) {
+        console.warn(
+          `[gbrain chunker] incomplete AST for ${filePath}: chunks cover ` +
+          `${coveredChars} of ${source.length} chars (${((coveredChars / source.length) * 100).toFixed(1)}%); ` +
+          `falling back to recursive chunks`,
+        );
+        return { chunks: fallbackChunks(source, filePath, language, opts), edges: rawEdges };
+      }
+    }
+
     return { chunks: capOversizedChunks(mergeSmallSiblings(chunks, chunkTarget), filePath, language, opts), edges: rawEdges };
   } catch (err: unknown) {
     warnParseFailure(language, filePath, err);
@@ -1449,6 +1479,17 @@ function extractSymbolName(node: any): string | null {
   const definition = node.childForFieldName('definition');
   if (definition) {
     const nested = extractSymbolName(definition);
+    if (nested) return nested;
+  }
+
+  // Local port: C/C++ function_definition stores the function name below the
+  // `declarator` field (function_declarator -> declarator -> identifier),
+  // rather than exposing a direct `name` field. Resolve only declarator
+  // wrappers here so a type/declaration node cannot donate an unrelated
+  // identifier as the symbol name.
+  const declarator = node.childForFieldName('declarator');
+  if (declarator) {
+    const nested = extractSymbolName(declarator);
     if (nested) return nested;
   }
 

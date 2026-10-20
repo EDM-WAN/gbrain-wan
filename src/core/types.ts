@@ -116,6 +116,8 @@ export interface Page {
    * The autopilot purge phase hard-deletes rows where `deleted_at < now() - 72h`.
    */
   deleted_at?: Date | null;
+  /** Optional tag projection requested by `list_pages(include_tags=true)`. */
+  tags?: string[];
   /**
    * v0.29.1: content date computed from frontmatter precedence chain
    * (event_date / date / published / filename / fallback). Populated by
@@ -392,6 +394,12 @@ export interface PageFilters {
    * read none of those fields (list_pages).
    */
   listColumnsOnly?: boolean;
+  /**
+   * v0.51.x — project `tags` in one batched query on the listing itself, so
+   * a consumer (web Memory Library) renders tag chips without one `get_page`
+   * per row. Off by default: the default path pays zero extra query cost.
+   */
+  includeTags?: boolean;
 }
 
 /** v0.26.5 — opts for getPage / softDeletePage / restorePage. */

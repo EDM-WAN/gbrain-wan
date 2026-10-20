@@ -54,6 +54,10 @@ export const DELEGATED_SYNC_OPTION_FIELDS = {
   noBulk: 'boolean',
   lanes: 'number',
   explicitProcessing: 'string[]',
+  /** Which chunker lane the delegated sync runs (Plan D arg passthrough). */
+  strategy: 'string',
+  /** Sync concurrency, passed through to the child sync. */
+  concurrency: 'number',
   timeoutSeconds: 'number',
 } as const;
 
@@ -86,6 +90,10 @@ export interface DelegatedSyncOptions {
   lanes?: number;
   /** #6317: the processing options the caller set itself; the managed cursor supplies the rest. */
   explicitProcessing?: Array<typeof DELEGATED_SYNC_PROCESSING_KEYS[number]>;
+  /** Chunker lane for this delegated sync (`markdown` | `code` | `auto`). */
+  strategy?: 'markdown' | 'code' | 'auto';
+  /** Sync concurrency override; omitted → the child's own default. */
+  concurrency?: number;
   /**
    * REQUIRED — the client always sends its resolved hard deadline so a job
    * whose client died stays bounded. `0` is the single unbounded encoding

@@ -290,6 +290,10 @@ function classicSyncOpts(options: DelegatedSyncOptions, sourceId: string | undef
     skipFailed: options.skipFailed,
     retryFailed: options.retryFailed,
     includeGitignored: options.includeGitignored,
+    // Plan D arg passthrough: the delegated sync honors the caller's chunker
+    // lane / concurrency instead of silently running the child default.
+    strategy: options.strategy,
+    concurrency: options.concurrency,
   };
 }
 

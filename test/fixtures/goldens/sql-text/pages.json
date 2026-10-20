@@ -606,6 +606,112 @@
           }
         ]
       },
+      "listPagesCount": {
+        "default": [
+          {
+            "lane": "pool",
+            "params": [],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1 AND p.deleted_at IS NULL",
+            "textSha256": "57829ca9159cb8cabab1a53d6b8d35ec7a61c600ea6ffc199e4aa0424b78e4ab"
+          }
+        ],
+        "effective_after": [
+          {
+            "lane": "pool",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1 AND p.deleted_at IS NULL AND p.effective_date >= $1::timestamptz",
+            "textSha256": "bdf82a82e3aa716c45473516bbae59e1635e4d3cbf69f64bfa83c98244befabf"
+          }
+        ],
+        "effective_before": [
+          {
+            "lane": "pool",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1 AND p.deleted_at IS NULL AND p.effective_date <= $1::timestamptz",
+            "textSha256": "8252b441d5cb2790c9b5b241aefb857a6280b92226b1a3931042c664d36f2a2c"
+          }
+        ],
+        "excludePrivate": [
+          {
+            "lane": "pool",
+            "params": [],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1 AND p.deleted_at IS NULL AND ((COALESCE(p.frontmatter->>'visibility', CASE WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(p.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN p.type = 'atom' THEN EXISTS (SELECT 1 FROM pages derived_origin WHERE derived_origin.source_id = p.source_id AND derived_origin.slug = p.frontmatter->>'source_slug' AND derived_origin.frontmatter->>'visibility' = 'private') WHEN (p.type IN ('atom', 'question') OR (p.type = 'concept' AND p.frontmatter->>'synthesized_by' IS NOT NULL)) THEN EXISTS (SELECT 1 FROM links derived_input_link JOIN pages derived_input ON derived_input.id = derived_input_link.to_page_id WHERE derived_input_link.from_page_id = p.id AND derived_input_link.link_source = 'concept-provenance' AND derived_input_link.link_type = 'synthesized_from' AND (COALESCE(derived_input.frontmatter->>'visibility', CASE WHEN derived_input.type = 'atom' THEN 'private' ELSE 'world' END) = 'private' OR EXISTS (SELECT 1 FROM pages derived_input_origin WHERE derived_input_origin.source_id = derived_input.source_id AND derived_input_origin.slug = derived_input.frontmatter->>'source_slug' AND derived_input_origin.frontmatter->>'visibility' = 'private'))) WHEN p.type = 'event' AND p.frontmatter->>'captured_via' LIKE 'life-chronicle:%' THEN NOT EXISTS (SELECT 1 FROM pages chronicle_origin WHERE chronicle_origin.source_id = p.source_id AND chronicle_origin.slug = p.frontmatter->'event'->>'depth' AND (COALESCE(chronicle_origin.frontmatter->>'visibility', CASE WHEN (chronicle_origin.type IN ('atom', 'question') OR (chronicle_origin.type = 'concept' AND chronicle_origin.frontmatter->>'synthesized_by' IS NOT NULL)) THEN 'private' ELSE 'world' END) <> 'private' AND NOT COALESCE(chronicle_origin.frontmatter ? 'pinned_question', false)) AND NOT (CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = chronicle_origin.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(chronicle_origin.frontmatter->'derived_from') = 'array' THEN chronicle_origin.frontmatter->'derived_from' ELSE jsonb_build_array(chronicle_origin.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END)) ELSE false END) AND NOT (CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') IN ('array', 'string') THEN EXISTS ( SELECT 1 FROM pages declared_origin WHERE declared_origin.source_id = p.source_id AND declared_origin.frontmatter->>'visibility' = 'private' AND declared_origin.slug = ANY(ARRAY( SELECT regexp_replace(declared.slug, '\\.md$', '') FROM jsonb_array_elements_text( CASE WHEN jsonb_typeof(p.frontmatter->'derived_from') = 'array' THEN p.frontmatter->'derived_from' ELSE jsonb_build_array(p.frontmatter->'derived_from') END) AS declared(slug)))) ELSE false END))",
+            "textSha256": "fde8152a24d2fa7dba4db4c6873ec931e85184fa3c849def2b600876837f6d64"
+          }
+        ],
+        "includeDeleted": [
+          {
+            "lane": "pool",
+            "params": [],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1",
+            "textSha256": "ecbeea0be9cff5805c392883df1cf37a1020faf826ddeb72edbb6d7d036dd6a1"
+          }
+        ],
+        "slugPrefix": [
+          {
+            "lane": "pool",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1 AND p.slug LIKE $1 ESCAPE '\\' AND p.deleted_at IS NULL",
+            "textSha256": "97f28daf4e9630b731e06fe20435bd67d1628c75dfb3bd852c3ef99ace6f3262"
+          }
+        ],
+        "sourceId": [
+          {
+            "lane": "pool",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1 AND p.source_id = $1 AND p.deleted_at IS NULL",
+            "textSha256": "f5a866219af9d01c26f74163908feccc2be99e0f1f58ce889aeb24dfb9b176b5"
+          }
+        ],
+        "sourceIds": [
+          {
+            "lane": "pool",
+            "params": [
+              "array<string>"
+            ],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1 AND p.source_id = ANY($1::text[]) AND p.deleted_at IS NULL",
+            "textSha256": "1f1989337606b98f922c735c03f74029cc6e61ea2258bb5fc45969726acf0956"
+          }
+        ],
+        "tag": [
+          {
+            "lane": "pool",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p JOIN tags t ON t.page_id = p.id WHERE 1=1 AND t.tag = $1 AND p.deleted_at IS NULL",
+            "textSha256": "2959adc0d2e92cacde237d8b019e2351595444ddee751848820d5667c61e6ba9"
+          }
+        ],
+        "type": [
+          {
+            "lane": "pool",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1 AND p.type = $1 AND p.deleted_at IS NULL",
+            "textSha256": "5493ce787ecb38d454c34fb3ec59e86ac8ba04c55dcd8909ccbbae23580f4d1b"
+          }
+        ],
+        "updated_after": [
+          {
+            "lane": "pool",
+            "params": [
+              "string"
+            ],
+            "sql": "SELECT COUNT(DISTINCT p.id) AS total FROM pages p WHERE 1=1 AND p.updated_at > $1::text::timestamptz AND p.deleted_at IS NULL",
+            "textSha256": "574c46607cd65199b826ac686e7c82263bbcd9ef4fa814573f951f19d79b556f"
+          }
+        ]
+      },
       "listPrefixSampledPages": {
         "default": [
           {

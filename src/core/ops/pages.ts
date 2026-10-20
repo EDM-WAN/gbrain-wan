@@ -28,6 +28,7 @@ import { resolveExcludePrivatePages, isPrivatePage, findPrivateOnlySlugs } from 
 import { LIST_PAGES_DESCRIPTION, CAPTURE_DESCRIPTION } from '../operations-descriptions.ts';
 import { listPagesPagination, listingTruncatedNotice } from './list-pages-pagination.ts';
 import { OperationError, opError, type Operation, type OperationContext } from './contract.ts';
+import { hasScope } from '../scope.ts';
 import { invalidParam, readFix } from './op-fix.ts';
 import { isDatetimeInputError } from '../utils.ts';
 import { rethrowNamingRevisionSource } from './put-page-revision-source.ts';
@@ -495,6 +496,21 @@ const list_pages: Operation = {
       type: 'string',
       description: "One source, or '__all__'.",
     },
+    // v0.51.x — folder/prefix enumeration and batched list metadata. Same
+    // contract as the Wegent-informed patch these came from: opt-in only, so
+    // the default path stays a bare array and pays no COUNT or tag query.
+    slug_prefix: {
+      type: 'string',
+      description: 'Literal prefix filter for page slugs, for example wiki/error-. Use with pagination to enumerate a folder or filename prefix.',
+    },
+    include_tags: {
+      type: 'boolean',
+      description: 'Include page tags in the list response using one batched query. Default false.',
+    },
+    include_total: {
+      type: 'boolean',
+      description: 'v0.51.x: when true, return { total, limit, offset, has_more, pages } instead of a bare array. total is one COUNT(*) matching the same filters.',
+    },
   },
   handler: async (ctx, p) => {
     // Whitelist the sort enum at the handler before passing to the engine.
@@ -528,6 +544,12 @@ const list_pages: Operation = {
     // every source.
     const sourceIdParam = parseSourceIdParam(p.source_id, 'list_pages', { allowAll: true });
     const scope = federatedSearchScope(ctx, sourceIdParam);
+    // v0.51.x — literal slug-prefix folder enumeration. Escaped as a LIKE
+    // literal in the shared WHERE builder, so it cannot inject wildcards.
+    const slugPrefix = typeof p.slug_prefix === 'string' ? p.slug_prefix.trim() : undefined;
+    if (slugPrefix !== undefined && slugPrefix.length > 200) {
+      throw invalidParam(ctx, 'list_pages', 'slug_prefix', 'list_pages: slug_prefix must be at most 200 characters.', { def: list_pages.params.slug_prefix, example: 'wiki/error-' });
+    }
     // #4620: an explicit source_id must name a live source (after the grant check).
     await assertExplicitSourceLive(ctx, sourceIdParam);
     // #4352 remediation: untrusted listing never enumerates
@@ -556,6 +578,7 @@ const list_pages: Operation = {
     }
     // Thread offset through — PageFilters has supported it all along; the op
     // layer just never passed it, so `--offset` was accepted and ignored.
+    const includeTags = p.include_tags === true;
     const requestedOffset = p.offset as number | undefined;
     const offset =
       requestedOffset !== undefined && Number.isFinite(requestedOffset) && requestedOffset > 0
@@ -576,6 +599,8 @@ const list_pages: Operation = {
       updated_after: updatedAfterKeyset ? undefined : updatedAfter,
       updatedAfterKeyset,
       sort,
+      slugPrefix: slugPrefix || undefined,
+      includeTags: p.include_tags === true,
       excludePrivate,
       listColumnsOnly: true,
       ...scope,
@@ -612,15 +637,42 @@ const list_pages: Operation = {
     ctx.emitResponseMeta?.('pagination', pagination);
     const truncatedNotice = isLocal ? null : listingTruncatedNotice(pagination, p);
     if (truncatedNotice) ctx.emitNotice?.(truncatedNotice);
-    return pages.map(pg => ({
+    const mapped = pages.map(pg => ({
       slug: pg.slug,
       source_id: pg.source_id,
       type: pg.type,
       title: pg.title,
       updated_at: pg.updated_at,
       updated_at_iso: pg.updated_at_iso,
+      ...(includeTags ? { tags: pg.tags ?? [] } : {}),
       ...(pg.deleted_at ? { deleted_at: pg.deleted_at } : {}),
     }));
+    // v0.51.x — Wegent-style pagination metadata: one COUNT over the exact
+    // same predicates, only when the caller explicitly opts in. The default
+    // path stays a bare array and pays zero COUNT cost, so legacy consumers
+    // (and the CLI's tab-separated output) are untouched.
+    if (p.include_total === true) {
+      const total = await ctx.engine.listPagesCount({
+        type: p.type as any,
+        tag: p.tag as string,
+        includeDeleted: (p.include_deleted as boolean) === true,
+        updated_after: updatedAfterKeyset ? undefined : updatedAfter,
+        updatedAfterKeyset,
+        sort,
+        slugPrefix: slugPrefix || undefined,
+        excludePrivate,
+        ...scope,
+      });
+      const effectiveOffset = offset ?? 0;
+      return {
+        total,
+        limit,
+        offset: effectiveOffset,
+        has_more: effectiveOffset + mapped.length < total,
+        pages: mapped,
+      };
+    }
+    return mapped;
   },
   scope: 'read', mutating: false,
   cliHints: { name: 'list' },
@@ -674,10 +726,204 @@ const capture: Operation = {
   },
 };
 
+// --- Local port: memory-library folder/file explorer (upstream #4400) ---
+// Ported from the 0.48 development line. `source_inventory` and `purge_pages`
+// are not upstream in 0.60; they power gbrain-web's Memory Library (per-source
+// folder tree + permanent delete). Kept here rather than upstreamed so a
+// future `gbrain self-upgrade` does not silently drop them again.
+const source_inventory: Operation = {
+  name: 'source_inventory',
+  description: 'Return a source-scoped folder inventory and one paginated batch of direct files. Intended for large Memory Library sources; does not enumerate every page into the client.',
+  params: {
+    source_id: { type: 'string', required: true, description: 'One source id.' },
+    folder: { type: 'string', description: 'Folder path in the source file namespace. Empty string means the root.' },
+    limit: { type: 'number', description: 'Direct files per batch (default 48, max 100).' },
+    offset: { type: 'number', description: 'Offset within direct files.' },
+    type: { type: 'string', description: 'Optional page type filter.' },
+    tag: { type: 'string', description: 'Optional tag filter.' },
+    sort: { type: 'string', enum: ['updated_desc', 'updated_asc', 'created_desc', 'slug'], description: 'Page ordering for stable pagination.' },
+    recursive: { type: 'boolean', description: 'Include every descendant file in the folder; empty folder means the entire source and should only be used with pagination/dry-run.' },
+    include_source_id: { type: 'boolean', description: 'Include each folder entry source_id in cross-source inventory responses.' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    const requestedSourceId = typeof p.source_id === 'string' ? p.source_id.trim() : '';
+    if (!requestedSourceId) throw new OperationError('invalid_params', 'source_id is required.');
+    const scope = federatedSearchScope(ctx, requestedSourceId);
+    const folder = typeof p.folder === 'string' ? p.folder.trim().replace(/^\/+|\/+$/g, '') : '';
+    const recursive = p.recursive === true;
+    if (requestedSourceId === '__all__' && recursive && !folder) {
+      // The Memory Library enumerates each registered source separately so it
+      // can track per-source pagination and cross-source identity. A single
+      // source-wide recursive sweep would both defeat that and (for a frontend
+      // that maps folder → source) risk mis-scoping folder deletes.
+      throw new OperationError('invalid_params', 'recursive source-wide inventory must be queried one concrete source at a time.');
+    }
+    const includeSourceId = p.include_source_id === true;
+    const limit = Math.max(1, Math.min(Number.isFinite(p.limit as number) ? Math.floor(p.limit as number) : 48, 100));
+    const offset = Number.isFinite(p.offset as number) && (p.offset as number) > 0 ? Math.floor(p.offset as number) : 0;
+    const pathExpr = `CASE WHEN p.page_kind = 'code' THEN COALESCE(NULLIF(p.frontmatter->>'file', ''), p.source_path, p.slug) ELSE p.slug END`;
+    const privateExclude = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+    const privateWhere = privateExclude ? ` AND COALESCE(p.frontmatter->>'visibility', 'world') <> 'private'` : '';
+    const hasType = typeof p.type === 'string' && p.type.length > 0;
+    const hasTag = typeof p.tag === 'string' && p.tag.length > 0;
+    const rawSort = typeof p.sort === 'string' ? p.sort : 'slug';
+    const sort = (['updated_desc', 'updated_asc', 'created_desc', 'slug'] as const).includes(rawSort as 'updated_desc' | 'updated_asc' | 'created_desc' | 'slug')
+      ? rawSort as 'updated_desc' | 'updated_asc' | 'created_desc' | 'slug'
+      : 'slug';
+    const sortColumn = sort === 'updated_desc' || sort === 'updated_asc' ? 'p.updated_at' : sort === 'created_desc' ? 'p.created_at' : pathExpr;
+    const sortDirection = sort === 'updated_desc' || sort === 'created_desc' ? 'DESC' : 'ASC';
+    const pageOrder = sort === 'slug'
+      ? `${pathExpr} ASC, p.source_id ASC, p.slug ASC`
+      : `${sortColumn} ${sortDirection} NULLS LAST, p.source_id ASC, p.slug ASC`;
+    const sourcePredicate = (params: unknown[]): string => {
+      if (scope.sourceIds && scope.sourceIds.length > 0) {
+        params.push(scope.sourceIds);
+        return `p.source_id = ANY($${params.length}::text[])`;
+      }
+      if (scope.sourceId) {
+        params.push(scope.sourceId);
+        return `p.source_id = $${params.length}`;
+      }
+      return 'TRUE';
+    };
+    const buildWhere = (params: unknown[], folderMode: 'direct' | 'subtree' | 'root') => {
+      const clauses = [sourcePredicate(params), `p.deleted_at IS NULL${privateWhere}`];
+      if (folderMode === 'subtree') {
+        if (folder) {
+          params.push(folder);
+          const folderParam = `$${params.length}::text`;
+          clauses.push(`left((${pathExpr}), char_length(${folderParam}) + 1) = ${folderParam} || '/'`);
+        }
+        // Empty subtree folder is the source root: no path predicate, so a
+        // recursive inventory can safely enumerate every page in that source.
+      } else if (folderMode === 'direct') {
+        params.push(folder);
+        const folderParam = `$${params.length}::text`;
+        clauses.push(`left((${pathExpr}), char_length(${folderParam}) + 1) = ${folderParam} || '/'`);
+        clauses.push(`substring((${pathExpr}) FROM char_length(${folderParam}) + 2) NOT LIKE '%/%'`);
+      } else {
+        clauses.push(`(${pathExpr}) NOT LIKE '%/%'`);
+      }
+      if (hasType) {
+        params.push(p.type);
+        clauses.push(`p.type = $${params.length}`);
+      }
+      if (hasTag) {
+        params.push(p.tag);
+        clauses.push(`EXISTS (SELECT 1 FROM tags pt WHERE pt.page_id = p.id AND pt.tag = $${params.length})`);
+      }
+      return clauses.join(' AND ');
+    };
+    const directParams: unknown[] = [];
+    const directWhere = buildWhere(directParams, folder ? (recursive ? 'subtree' : 'direct') : (recursive ? 'subtree' : 'root'));
+    directParams.push(limit);
+    const limitParam = `$${directParams.length}`;
+    directParams.push(offset);
+    const offsetParam = `$${directParams.length}`;
+    const pages = await ctx.engine.executeRaw<Record<string, unknown>>(
+      `SELECT p.slug, p.source_id, p.type, p.title, p.updated_at,
+              COALESCE((SELECT jsonb_agg(pt.tag ORDER BY pt.tag) FROM tags pt WHERE pt.page_id = p.id), '[]'::jsonb) AS tags
+         FROM pages p WHERE ${directWhere}
+        ORDER BY ${pageOrder} LIMIT ${limitParam} OFFSET ${offsetParam}`,
+      directParams,
+    );
+    const countParams: unknown[] = [];
+    const countWhere = buildWhere(countParams, folder ? (recursive ? 'subtree' : 'direct') : (recursive ? 'subtree' : 'root'));
+    const countRows = await ctx.engine.executeRaw<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM pages p WHERE ${countWhere}`,
+      countParams,
+    );
+    const inventoryParams: unknown[] = [];
+    const inventorySource = sourcePredicate(inventoryParams);
+    inventoryParams.push(folder);
+    const folderRef = `$${inventoryParams.length}::text`;
+    let inventoryWhere = `${inventorySource} AND p.deleted_at IS NULL${privateWhere}`;
+    if (hasType) {
+      inventoryParams.push(p.type);
+      inventoryWhere += ` AND p.type = $${inventoryParams.length}`;
+    }
+    if (hasTag) {
+      inventoryParams.push(p.tag);
+      inventoryWhere += ` AND EXISTS (SELECT 1 FROM tags pt WHERE pt.page_id = p.id AND pt.tag = $${inventoryParams.length})`;
+    }
+    const folderRows = await ctx.engine.executeRaw<Record<string, unknown>>(
+      `WITH page_paths AS (
+         SELECT p.source_id, ${pathExpr} AS path FROM pages p WHERE ${inventoryWhere}
+       ), scoped AS (
+         SELECT source_id, CASE WHEN ${folderRef} = '' THEN path ELSE substring(path FROM char_length(${folderRef}) + 2) END AS rel
+           FROM page_paths WHERE (${folderRef} = '' OR left(path, char_length(${folderRef}) + 1) = ${folderRef} || '/')
+       ), child_pages AS (
+         SELECT source_id, split_part(rel, '/', 1) AS child, rel FROM scoped WHERE rel LIKE '%/%'
+       )
+       SELECT child AS name,
+              CASE WHEN ${folderRef} = '' THEN child ELSE ${folderRef} || '/' || child END AS path,
+              NULL::text AS source_id,
+              ${includeSourceId ? `array_agg(DISTINCT source_id ORDER BY source_id)` : `NULL::text[]`} AS source_ids,
+              COUNT(*)::int AS subtree_count,
+              COUNT(DISTINCT source_id)::int AS source_count,
+              COUNT(*) FILTER (WHERE rel NOT LIKE '%/%')::int AS direct_count,
+              COUNT(DISTINCT source_id || ':' || split_part(substring(rel FROM char_length(child) + 2), '/', 1)) FILTER (WHERE rel LIKE '%/%')::int AS child_folder_count
+         FROM child_pages GROUP BY child ORDER BY child`,
+      inventoryParams,
+    );
+    return {
+      source_id: requestedSourceId,
+      folder,
+      total: Number(countRows[0]?.count ?? 0),
+      has_more: offset + pages.length < Number(countRows[0]?.count ?? 0),
+      pages,
+      folders: folderRows,
+    };
+  },
+  cliHints: { name: 'source_inventory', hidden: true },
+};
+
+const purge_pages: Operation = {
+  name: 'purge_pages',
+  description: 'Permanently delete a bounded batch of source-scoped pages immediately. This is irreversible and cascades chunks, embeddings, links, timeline, tags, versions, and code edges. Requires admin scope and explicit confirmation.',
+  idempotent: false,
+  outputRedaction: 'no_stored_text',
+  params: {
+    slugs: { type: 'array', required: true, items: { type: 'string' }, description: 'Page slugs to permanently delete (max 200). All must belong to source_id.' },
+    source_id: { type: 'string', required: true, description: 'Source holding the pages.' },
+    confirm_destructive: { type: 'boolean', required: true, description: 'Must be true to perform irreversible deletion.' },
+    dry_run: { type: 'boolean', description: 'Return impact without deleting.' },
+  },
+  mutating: true,
+  scope: 'admin',
+  handler: async (ctx, p) => {
+    const slugs = Array.isArray(p.slugs) ? p.slugs.filter((slug): slug is string => typeof slug === 'string' && slug.length > 0) : [];
+    const sourceId = parseSourceIdParam(p.source_id, 'purge_pages');
+    if (!sourceId) throw new OperationError('invalid_params', 'purge_pages requires source_id');
+    if (slugs.length === 0 || slugs.length > 200) throw new OperationError('invalid_params', 'purge_pages requires 1-200 slugs');
+    for (const slug of slugs) validatePageSlug(slug);
+    // Server-side authority gate, mirroring 0.60's stance that an irreversible
+    // purge needs an admin-granted caller: the local CLI, or a remote client
+    // holding the `admin` scope (gbrain-web's OAuth client does). The
+    // `confirm_destructive` flag is only an intent check the caller can forge,
+    // so it is NOT the security boundary.
+    if (ctx.remote !== false && !hasScope(ctx.auth?.scopes ?? [], 'admin')) {
+      throw new OperationError('permission_denied', 'purge_pages requires the local CLI or an admin-scoped client');
+    }
+    const dryRun = p.dry_run === true || ctx.dryRun;
+    const rows = await ctx.engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE source_id = $1 AND slug = ANY($2::text[])`,
+      [sourceId, slugs],
+    );
+    const found = rows.map((row) => row.slug);
+    if (dryRun) return { status: 'dry_run', source_id: sourceId, requested: slugs.length, found: found.length, slugs: found };
+    if (p.confirm_destructive !== true) throw new OperationError('confirmation_required', 'purge_pages requires confirm_destructive=true');
+    const deleted = await ctx.engine.deletePages(found, { sourceId });
+    return { status: 'purged', source_id: sourceId, count: deleted.length, slugs: deleted };
+  },
+  cliHints: { name: 'purge_pages', hidden: true },
+};
+
 // (Page CRUD quartet first, then the v0.26.5 destructive-guard ops:
 // page-level soft-delete recovery + admin purge, then capture.)
 export const pagesOperations: Operation[] = [
-  get_page, put_page, delete_page, list_pages,
-  restore_page, purge_deleted_pages, capture,
+  get_page, put_page, delete_page, list_pages, source_inventory,
+  restore_page, purge_pages, purge_deleted_pages, capture,
   fetch_page,
 ];

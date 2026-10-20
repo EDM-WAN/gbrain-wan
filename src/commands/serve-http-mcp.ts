@@ -28,6 +28,7 @@ import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
 import { scopeDeniedError } from '../core/ops/op-fix.ts';
 import { resolveStrictParamsMode } from '../mcp/validate-params.ts';
 import { GBRAIN_CLIENT_HEADER, resolveResultRowsMode, resultRowsForRequest, type ResultRowsMode } from '../mcp/result-rows.ts';
+import { GBRAIN_SOURCE_SCOPE_HEADER, narrowAllowedSources } from '../mcp/request-scope.ts';
 import { buildToolDefs } from '../mcp/tool-defs.ts';
 import {
   filterOpsForSurface,
@@ -122,7 +123,24 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
     requireBearerAuth({ verifier: resourceVerifier, resourceMetadataUrl }), ['read', 'write'],
   ), async (req: Request, res: Response) => {
     const startTime = Date.now();
-    const authInfo = (req as any).auth as AuthInfo;
+    const verifiedAuthInfo = (req as any).auth as AuthInfo;
+
+    // Per-request read-scope narrowing (`X-Gbrain-Source-Scope`, narrow-only).
+    // A deployment that fronts one brain with a single shared OAuth client
+    // cannot otherwise express per-user visibility: every request carries the
+    // same grant, so unqualified reads span it and leak across users. The
+    // header lets such a front end ask for a SUBSET of its own grant; it is
+    // attacker-controlled, so `narrowAllowedSources` intersects with the
+    // granted set and can only ever reduce authority — never widen it, and an
+    // unmatched request fails closed to the deny-all sentinel. Write authority
+    // (`sourceId`) is deliberately untouched.
+    const narrowedAllowedSources = narrowAllowedSources(
+      verifiedAuthInfo.allowedSources,
+      req.get(GBRAIN_SOURCE_SCOPE_HEADER),
+    );
+    const authInfo: AuthInfo = narrowedAllowedSources === undefined
+      ? verifiedAuthInfo
+      : { ...verifiedAuthInfo, allowedSources: narrowedAllowedSources };
 
     // Human-readable agent name is now threaded through AuthInfo by
     // verifyAccessToken (which JOINs oauth_clients in its existing token
