@@ -1,0 +1,400 @@
+/**
+ * Doctor check categorization — single source of truth.
+ *
+ * Every `Check.name` produced by `src/commands/doctor.ts` is assigned to
+ * exactly one of four categories:
+ *
+ *   - brain : data-integrity signals (embedding coverage, page health, sync
+ *             freshness, facts/takes/calibration data quality, contradictions,
+ *             content-sanity audit findings). The "is my brain's data healthy?"
+ *             question lives here.
+ *   - skill : RESOLVER.md / skill conformance / routing-eval / filing-audit /
+ *             whoknows expert routing. The "is my agent's skill dispatcher
+ *             configured?" question.
+ *   - ops   : infrastructure liveness — DB connection, pgvector, RLS,
+ *             supervisor, queue depth, OAuth confidential clients, autopilot
+ *             lock scope, reranker/provider reachability. The "is the
+ *             machinery actually running?" question.
+ *   - meta  : schema version, migrations, upgrade trail, eval capture, slug
+ *             fallback audit, schema-pack drift. The "is gbrain itself
+ *             coherent?" question.
+ *
+ * Why this matters: the doctor's legacy `health_score` ( 100 − 20×fails −
+ * 5×warns ) weights every check equally. A skill routing miss costs the same
+ * as a corrupt embedding column. With categorization, the doctor surfaces a
+ * brain_checks_score and category_scores so operators see signal-to-noise on
+ * the question they're actually asking.
+ *
+ * Naming discipline: this module owns the *category penalty* score
+ * (`brain_checks_score`), which is ORTHOGONAL to `BrainHealth.brain_score`
+ * (the weighted 35/25/15/15/10 composite surfaced by the `brain_score`
+ * doctor check). The two answer different questions:
+ *
+ *   - brain_score        : "how healthy is the brain's data composition?"
+ *   - brain_checks_score : "how many brain-category doctor checks failed?"
+ *
+ * The doctor renders both side by side.
+ *
+ * Drift contract: every check name that ships through doctor MUST appear in
+ * exactly one set below. The drift-guard test in
+ * `test/doctor-categories.test.ts` enforces this by reading doctor check
+ * emitter sources via a tagged-string scan and asserting set membership
+ * exactly.
+ *
+ * If you add a new doctor check, you MUST add its name to the appropriate
+ * set here. The categorize step in `src/commands/doctor.ts` falls through
+ * to 'meta' for any unknown name AND emits a once-per-process stderr warn
+ * so a missing addition surfaces in dev runs even before the test catches
+ * it in CI.
+ */
+
+export type CheckCategory = 'brain' | 'skill' | 'ops' | 'meta';
+
+/**
+ * Data-integrity signals. Everything that asks "is the brain's actual data
+ * healthy and complete?"
+ */
+export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
+  'abandoned_threads',
+  'atom_provenance_drift',
+  'captured_facts_active',
+  'conversation_label_facts',
+  'conversation_outcomes_stale',
+  'connector_checkpoints',
+  'connector_held_items',
+  'git_held_files',
+  'fence_integrity',
+  // #5575: stored trust tier counts, the legacy-row backfill, scan and source claims.
+  'trust_tiers',
+  'trust_scan',
+  'trust_sources_unclaimed',
+  'credential_projection_pending',
+  'derived_visibility',
+  'extractor_facts_expired',
+  'loop_facts_drift',
+  'ontology_facts_fenced',
+  'orphan_persistence_bindings',
+  'foreign_ownership_marker',
+  'safe_index_pending',
+  'self_capture',
+  'brain_score',
+  'calibration_freshness',
+  'child_table_orphans',
+  'chronicle_projection_health',
+  'auto_chronicle',
+  'auto_chronicle_default_on',
+  'chronicle_config_invalid',
+  'facts_drain',
+  'fact_take_vectors',
+  'code_chunk_metadata',
+  'content_hash_duplicates',
+  'content_sanity_audit_recent',
+  'contextual_retrieval_coverage',
+  'contradictions',
+  'conversation_facts_backlog',
+  'conversation_format_coverage',
+  'conversation_parser_probe_health',
+  'cross_modal_modality_backfill',
+  'cycle_freshness',
+  'dangling_aliases',
+  'effective_date_health',
+  // #4795 — reindex-search-vector marker still set: keyword index split
+  // across two tokenizers until the resumed run finishes.
+  'fts_reindex_incomplete',
+  'embed_staleness',
+  'embedding_column_registry',
+  'embedding_env_override',
+  // #5137: an env provider key shadowing a different config key.
+  'embedding_key_source',
+  'embedding_migration_state',
+  'embedding_provider',
+  // #5691: query-instruction advisory for instruction-style embedding models.
+  'embedding_query_prefix',
+  'embedding_width_consistency',
+  'embeddings',
+  'entity_link_coverage',
+  'eval_drift',
+  'extract_atoms_backlog',
+  // #6325: managed atom origins held after repeated extraction failures.
+  'extract_atoms_held_failed',
+  'extract_health',
+  'facts_embedding_width_consistency',
+  'facts_extraction_health',
+  'facts_health',
+  'frontmatter_integrity',
+  'frontmatter_repairable',
+  'malformed_path_pages',
+  'memory_writeback',
+  'core_memory',
+  'grade_confidence_drift',
+  'graph_coverage',
+  'graph_signals_coverage',
+  // Which extraction prompts resolve relative dates (informational).
+  'extraction_date_grounding',
+  'hidden_by_search_policy',
+  'image_assets',
+  // #6529: image pages without an image vector, apart from text coverage (plus NULL source_path and held images).
+  'image_embedding_coverage',
+  'integrity',
+  'jsonb_integrity',
+  // #4222 — near-empty entity pages that accreted huge edge counts (junk
+  // hubs polluting the graph): a data-quality signal, sibling of
+  // scraper_junk_pages / graph_coverage.
+  'junk_entity_hubs',
+  'link_resolution_opportunity',
+  'links_extraction_lag',
+  'markdown_body_completeness',
+  'nightly_quality_probe_health',
+  'ocr_health',
+  'orphan_ratio',
+  'oversized_pages',
+  'parked_effects',
+  'pglite_scratch_probe',
+  'quarantined_pages',
+  'raw_provenance',
+  'flagged_pages',
+  'salience_health',
+  'scraper_junk_pages',
+  'slug_collisions',
+  'source_config_shape',
+  'source_routing_health',
+  'stale_mentions',
+  'stub_guard_24h',
+  // Fact supersession threshold calibrated for the active embedding model (facts/supersession-threshold.ts).
+  'supersession_calibration',
+  'sync_failures',
+  // #5984: unfinished managed sync cursors, their remaining entries and indexing ETA.
+  'managed_sync_backlog',
+  'sync_freshness',
+  // #5063: source checkouts with commits not on their upstream or stale uncommitted changes.
+  'git_convergence',
+  // #5186: an ownership marker committed to a source checkout's Git index.
+  'tracked_ownership_marker',
+  'takes_count',
+  'takes_weight_grid',
+  // #5836: active facts with no entity (invisible to entity recall and the conflict sweep).
+  'unlinked_facts',
+  'edge_validity',
+  'text_projection_readiness',
+  'timeline_coverage',
+  'timeline_orphans',
+  'timeline_history',
+  // #6147: imported conversation pages that may still carry a typed credential (cached audit).
+  'transcript_secret_exposure',
+  // #5254 — pages written database-only to a source with no canonical owner.
+  'unbound_source',
+  'undeclared_db_only_pages',
+  'unified_multimodal_coverage',
+  'unverified_extractions',
+  'voice_gate_health',
+]);
+
+/**
+ * Skill dispatcher signals. RESOLVER.md reachability, skill frontmatter
+ * conformance, brain-first compliance, expert-routing, filing audit.
+ *
+ * Deliberately small: only checks that scan the host's `skills/` tree or
+ * skill-routing fixtures. Brain-data quality checks (even ones with a
+ * skill-flavored name) live under 'brain'.
+ */
+export const SKILL_CHECK_NAMES: ReadonlySet<string> = new Set([
+  'memory_verbs_usage',
+  'resolver_health',
+  'retrieval_reflex_health',
+  // Harness hook adapters: per-channel push-context visibility (sibling of
+  // retrieval_reflex_health — same "is my agent's context wiring live?" question).
+  'volunteer_channels',
+  'skill_brain_first',
+  'skill_conformance',
+  'skills_manifest_integrity',
+  'skill_currency',
+  'skill_preconditions',
+  'whoknows_health',
+]);
+
+/**
+ * Infrastructure liveness signals. DB, workers, OAuth, RLS, locks, providers.
+ */
+export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
+  // The effective chat_fallback_chain, its config plane, the providers it reaches and per-entry readiness.
+  'chat_fallback_chain',
+  // Agent operator wave: is an agent harness wired to this brain (registration read; --only adds the smoke test).
+  'harness_wiring',
+  // Cat 41: the provider-use decision gbrain setup recorded; declined = no provider request (discovery, probe).
+  'provider_consent',
+  'frontmatter_hook',
+  // F4b: PGLite row-delta planner statistics / Postgres autovacuum ANALYZE lag on the hot tables.
+  'planner_stats_stale',
+  'alternative_providers',
+  'autopilot_fanout_concurrency',
+  'autopilot_lock_scope',
+  'bootstrap_hook_schema_pairing',
+  'bootstrap_harness_health',
+  'bootstrap_hooks_heartbeat',
+  'bootstrap_last_verify',
+  'memorable_relay_health',
+  'backup_coverage',
+  'bootstrap_push_health',
+  'bootstrap_durability_job',
+  'bootstrap_runbook_skew',
+  'bootstrap_serve_lock',
+  'batch_retry_health',
+  'canonical_content_writes',
+  // Sources opted out of, or parked by, the shared-skills migration (checks/shared-skills.ts).
+  'shared_skills_sources',
+  'brainstorm_health',
+  'connectors',
+  'dream_paid_loop',
+  'connection',
+  'db_only_collector_collision',
+  'federation_health',
+  'google_file_modes',
+  'google_oauth',
+  'home_dir_in_worktree',
+  'index_audit',
+  'npm_squat',
+  'oauth_client_scope_health',
+  'oauth_confidential_client_health',
+  'orphan_clones',
+  'persistence_capacity',
+  'worktree_refresh_stuck',
+  'managed_guard_schema_drift',
+  'publication_refusals',
+  'persistence_request_growth',
+  'persistence_request_indexes',
+  'persistence_write_stall',
+  'lost_caller_writes',
+  'stale_frontmatter_keys',
+  'maintenance_write_drift',
+  'managed_sync_not_moving',
+  'persistence_session_timeouts',
+  // #6317: consumer heartbeat rows and host identity (doctor/checks/persistence-consumers.ts).
+  'two_consumers_on_host',
+  'consumers_without_heartbeat',
+  'host_identity_mismatch',
+  'stale_embedding_effects',
+  'vector_plan',
+  'keyword_plan',
+  'writer_version',
+  'pgbouncer_prepare',
+  'pglite_data_dir',
+  // db-availability loop: engine-fit + repair-recurrence signals.
+  'pglite_scale',
+  'db_repair_recurrence',
+  'pglite_leftovers',
+  // Engine graduation (PGLite -> Postgres) interrupted / split brain.
+  'graduation_interrupted',
+  'pgvector',
+  'postgres_cancellation_driver',
+  'plugin_lane_collision',
+  'pool_budget',
+  'progressive_batch_audit_health',
+  'queue_health',
+  // #4578: brain-wide maintenance jobs dying at their deadline.
+  'global_maintenance_timeouts',
+  // #5157: queued jobs from before the v0.50 authority cutover block every worker.
+  'legacy_job_authority',
+  // F3: legacy tokens on the JSONB-only grant shape (info) and grant drift (warn).
+  'legacy_token_grant_shape',
+  'legacy_token_grant_drift',
+  // Lane E: tokens minted without scopes (grandfathered read+write+admin).
+  'legacy_token_null_scope',
+  // D4: grants whose operation snapshot or stored surface keeps operations their scopes allow out of reach.
+  'grant_new_ops_available',
+  'reranker_health',
+  'rls',
+  'rls_event_trigger',
+  'search_mode',
+  'decide_health',
+  'pool_reap_health',
+  'self_upgrade_health',
+  'bun_runtime',
+  'stale_locks',
+  'subagent_capability',
+  'subagent_health',
+  'supervisor',
+  'supervisor_niceness',
+  'supervisor_singleton',
+  'sync_consolidation',
+  'wedged_queue',
+  'orphaned_private_queue',
+  'worker_oom_loop',
+]);
+
+/**
+ * gbrain-itself coherence signals. Schema migrations, version drift, audit
+ * housekeeping. Default category for unknown names (with stderr warn).
+ */
+export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
+  // The one-time behavior-change disclosure, readable again here (read-only).
+  'behavior_changes',
+  // Agent operator wave E11: recent agent dead ends from the agent-contract event log.
+  'agent_contract',
+  'cycle_phase_scope',
+  'default_source_local_path',
+  'eval_capture',
+  'retrieval_feedback_health',
+  // #4613 — links_link_source_check CHECK shape: schema coherence healed by
+  // `gbrain apply-migrations` (sibling of pages_upsert_arbiter).
+  'links_link_source_check',
+  'minions_migration',
+  'multi_source_drift',
+  'pack_upgrade_available',
+  // #550 — pages UNIQUE(source_id, slug) upsert arbiter presence: schema
+  // coherence healed by `gbrain apply-migrations` (sibling of
+  // timeline_dedup_index / schema_version).
+  'pages_upsert_arbiter',
+  // #5216: the resumable pages.knowledge_revision backfill (resumed by apply-migrations --force-schema).
+  'revision_backfill',
+  'schema_columns',
+  'schema_pack_active',
+  'schema_pack_consistency',
+  'schema_pack_source_drift',
+  'schema_version',
+  'slug_fallback_audit',
+  'timeline_dedup_index',
+  'type_proliferation',
+  'upgrade_errors',
+]);
+
+/**
+ * Stderr warn-once gate for unknown check names. Exported as a test seam so
+ * the categorizer test can re-trigger warns.
+ */
+const _warnedUnknown = new Set<string>();
+export function _resetUnknownCheckWarningsForTest(): void {
+  _warnedUnknown.clear();
+}
+
+/**
+ * Map a check name to its category. Unknown names fall through to 'meta'
+ * with a once-per-process stderr warning — the test in
+ * `test/doctor-categories.test.ts` is the structural guard, and the warn is
+ * the runtime backstop so contributors notice in dev before CI fails.
+ */
+export function categorizeCheck(name: string): CheckCategory {
+  if (BRAIN_CHECK_NAMES.has(name)) return 'brain';
+  if (SKILL_CHECK_NAMES.has(name)) return 'skill';
+  if (OPS_CHECK_NAMES.has(name)) return 'ops';
+  if (META_CHECK_NAMES.has(name)) return 'meta';
+  if (!_warnedUnknown.has(name)) {
+    _warnedUnknown.add(name);
+    process.stderr.write(
+      `[doctor-categories] unknown check name '${name}' — defaulting to 'meta'. Add it to src/core/doctor-categories.ts.\n`,
+    );
+  }
+  return 'meta';
+}
+
+/**
+ * Skill-category check group. Used by buildChecks's scope-branch gates to
+ * SKIP the (expensive, filesystem-walking) skill check group when the caller
+ * asked for scope=brain. This is the load-bearing escape hatch that makes
+ * `gbrain doctor --scope=brain` sub-second on a brain with thousands of
+ * skills (per D9 in the plan).
+ *
+ * Use this set as the source of truth for "do these checks belong to the
+ * skill group that the scope-branch gate skips?" — keeping the gate
+ * categorization and the per-check categorization aligned.
+ */
+export const SKILL_CHECK_GROUP_NAMES: ReadonlySet<string> = SKILL_CHECK_NAMES;
