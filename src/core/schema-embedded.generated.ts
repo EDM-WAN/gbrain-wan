@@ -371,6 +371,27 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   embedding_multimodal  vector(1024)
 );
 
+-- Cross-source embedding cache. A chunk's vector is a pure function of
+-- (model, dimensions, embedding input text) — nothing about which source,
+-- page or chunker version produced it. content_chunks stores one copy per
+-- (source, page, chunk), so the same file indexed under two sources is
+-- embedded twice, and a CHUNKER_VERSION bump re-embeds every source even when
+-- the chunk text is byte-identical. Measured on the real dsp trees: 2727 of
+-- 2732 pages were identical across two sources. This table is keyed on the
+-- hash of the exact embedding input, so a hit is always correct.
+CREATE TABLE IF NOT EXISTS embedding_cache (
+  input_hash   TEXT        PRIMARY KEY,
+  model        TEXT        NOT NULL,
+  dimensions   INTEGER     NOT NULL,
+  embedding    vector(1536),
+  token_count  INTEGER,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  hit_count    INTEGER     NOT NULL DEFAULT 0
+);
+-- Reclaim pass (see pruneEmbeddingCache) walks oldest-first.
+CREATE INDEX IF NOT EXISTS idx_embedding_cache_last_used ON embedding_cache(last_used_at);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_page_index ON content_chunks(page_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_chunks_page ON content_chunks(page_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (embedding vector_cosine_ops);

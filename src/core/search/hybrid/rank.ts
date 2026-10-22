@@ -202,7 +202,8 @@ export async function expandStructuralNeighbors(req: HybridRequest, fused: Searc
   const walkDepth = Math.min(opts?.walkDepth ?? 0, 2);
   // The optional code walk's raw graph hydration has no row-level read policy.
   // Keep it suspended for untrusted retrieval until that boundary is supported.
-  const needsExpansion = !requiresSafeChunks(opts) && (walkDepth > 0 || Boolean(opts?.nearSymbol));
+  const needsExpansion = !requiresSafeChunks(opts) && (walkDepth > 0 || Boolean(opts?.nearSymbol)
+    || (opts?.nearSymbols?.length ?? 0) > 0);
   let dedupOpts = opts?.dedupOpts;
 
   if (needsExpansion) {
@@ -211,6 +212,7 @@ export async function expandStructuralNeighbors(req: HybridRequest, fused: Searc
       const expanded = await expandAnchors(engine, anchorSet, {
         walkDepth,
         nearSymbol: opts?.nearSymbol,
+        nearSymbols: opts?.nearSymbols,
         sourceId: opts?.sourceId,
       });
       // Resolve new chunk IDs (not already in fused) into full rows.

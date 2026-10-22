@@ -163,6 +163,22 @@ describe('Layer 7 (A2) — expandAnchors', () => {
     expect(ids).toContain(chunkC); // 1-hop neighbor
   });
 
+  test('nearSymbols anchors every named symbol in one pass', async () => {
+    // think extracts identifiers from the question as a list; without the
+    // plural form each symbol cost a whole hybrid pipeline.
+    const expanded = await expandAnchors(engine, [], { nearSymbols: ['b'] });
+    expect(expanded.map(e => e.chunk_id)).toContain(chunkB);
+    expect(expanded.map(e => e.hop)).toEqual(expanded.map(() => 0));
+  });
+
+  test('nearSymbols is the union of nearSymbol and the array, deduped', async () => {
+    const both = await expandAnchors(engine, [], { nearSymbol: 'b', nearSymbols: ['b', ''] });
+    expect(both.map(e => e.chunk_id)).toEqual([chunkB]);
+    // A single empty anchor is not an anchor: the call stays a no-op.
+    const empty = await expandAnchors(engine, [], { nearSymbols: ['', '  '] });
+    expect(empty).toEqual([]);
+  });
+
   test('hydrateChunks fetches SearchResult rows for chunk IDs', async () => {
     const rows = await hydrateChunks(engine, [chunkB, chunkC]);
     expect(rows.length).toBe(2);

@@ -1293,6 +1293,13 @@ export interface SearchOpts extends PageReadPolicy {
    */
   nearSymbol?: string;
   /**
+   * Anchor at several qualified symbol names at once. `think` extracts every
+   * identifier-like token from the question, and a question naming two
+   * functions ("why does A call B") needs both anchored — serial calls would
+   * pay the whole hybrid pipeline per symbol. Union with `nearSymbol`.
+   */
+  nearSymbols?: string[];
+  /**
    * v0.20.0 Cathedral II: structural walk depth for two-pass retrieval. 0 = off
    * (default), 1 or 2 = expand that many hops through code_edges_chunk. Capped
    * at 2 in A2. When walkDepth > 0, dedup's per-page cap lifts to

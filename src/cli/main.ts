@@ -129,6 +129,8 @@ const SELF_HELP_WITHOUT_ENGINE: Record<string, true | (() => Promise<(engine: ne
   // runJobs accepts BrainEngine | null and its help guard returns before any
   // engine (or subcommand body) is touched.
   jobs: async () => (await import('../commands/jobs.ts')).runJobs as never,
+  // runEmbedCache answers --help before touching the engine.
+  'embed-cache': async () => (await import('../commands/embed-cache.ts')).runEmbedCache as never,
   // runDream accepts BrainEngine | null; --help (and `retriage --help`) is
   // answered before any engine-bearing work per the dream.ts IRON RULE.
   dream: async () => (await import('../commands/dream.ts')).runDream as never,

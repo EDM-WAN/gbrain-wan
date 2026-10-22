@@ -406,6 +406,9 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'reindex-search-vector', phase: 'post-connect', thinClient: 'none', load: () => import('./commands/reindex-search-vector.ts') },
   { name: 'reindex-frontmatter', phase: 'post-connect', thinClient: 'none', load: () => import('./commands/reindex-frontmatter.ts') },
   { name: 'backfill', phase: 'post-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/backfill.ts') },
+  // Cross-source embedding cache maintenance. Prints its own help, so it is
+  // answerable without a brain (see SELF_HELP_WITHOUT_ENGINE in main.ts).
+  { name: 'embed-cache', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/embed-cache.ts') },
   { name: 'code-callers', phase: 'post-connect', thinClient: 'refuse', routes_source: true, load: () => import('./commands/code-callers.ts') },
   { name: 'code-callees', phase: 'post-connect', thinClient: 'refuse', routes_source: true, load: () => import('./commands/code-callees.ts') },
   { name: 'repos', phase: 'post-connect', thinClient: 'none', load: () => import('./commands/repos.ts') },

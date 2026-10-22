@@ -56,6 +56,7 @@
       "drift_decisions.drift_decisions_pkey": "p PRIMARY KEY (id)",
       "drift_decisions.drift_decisions_recommended_weight_check": "c CHECK (((recommended_weight >= (0)::double precision) AND (recommended_weight <= (1)::double precision)))",
       "drift_decisions.drift_decisions_take_id_fkey": "f FOREIGN KEY (take_id) REFERENCES takes(id) ON DELETE CASCADE",
+      "embedding_cache.embedding_cache_pkey": "p PRIMARY KEY (input_hash)",
       "entity_identities.entity_identities_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "entity_identities.entity_identities_page_uniq": "u UNIQUE (source_id, page_id)",
       "entity_identities.entity_identities_pkey": "p PRIMARY KEY (id)",
@@ -393,6 +394,9 @@
       "think_ab_results.think_ab_results_pkey": "p PRIMARY KEY (id)",
       "think_ab_results.think_ab_results_preferred_check": "c CHECK ((preferred = ANY (ARRAY['baseline'::text, 'with_calibration'::text, 'neither'::text, 'tie'::text])))",
       "think_ab_results.think_ab_results_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
+      "think_stream_jobs.think_stream_jobs_offset_nonnegative": "c CHECK ((stream_offset >= 0))",
+      "think_stream_jobs.think_stream_jobs_pkey": "p PRIMARY KEY (id)",
+      "think_stream_jobs.think_stream_jobs_status": "c CHECK ((status = ANY (ARRAY['running'::text, 'completed'::text, 'failed'::text, 'cancelled'::text])))",
       "timeline_entries.timeline_entries_event_page_id_fkey": "f FOREIGN KEY (event_page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "timeline_entries.timeline_entries_page_id_fkey": "f FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE",
       "timeline_entries.timeline_entries_pkey": "p PRIMARY KEY (id)",
@@ -548,6 +552,9 @@
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "drift_decisions": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
+      "embedding_cache": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
       "entity_identities": [
@@ -856,6 +863,9 @@
       "think_ab_results": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "think_stream_jobs": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "timeline_entries": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -931,6 +941,7 @@
       "dream_verdicts_expires_idx": "CREATE INDEX dream_verdicts_expires_idx ON public.dream_verdicts USING btree (expires_at)",
       "dream_verdicts_pkey": "CREATE UNIQUE INDEX dream_verdicts_pkey ON public.dream_verdicts USING btree (file_path, content_hash)",
       "drift_decisions_pkey": "CREATE UNIQUE INDEX drift_decisions_pkey ON public.drift_decisions USING btree (id)",
+      "embedding_cache_pkey": "CREATE UNIQUE INDEX embedding_cache_pkey ON public.embedding_cache USING btree (input_hash)",
       "entity_identities_canonical_uniq": "CREATE UNIQUE INDEX entity_identities_canonical_uniq ON public.entity_identities USING btree (entity_id) WHERE canonical",
       "entity_identities_entity_idx": "CREATE INDEX entity_identities_entity_idx ON public.entity_identities USING btree (entity_id)",
       "entity_identities_page_uniq": "CREATE UNIQUE INDEX entity_identities_page_uniq ON public.entity_identities USING btree (source_id, page_id)",
@@ -988,6 +999,7 @@
       "idx_derivation_inputs_input": "CREATE INDEX idx_derivation_inputs_input ON public.derivation_inputs USING btree (input_table, input_id)",
       "idx_drift_decisions_decided_at": "CREATE INDEX idx_drift_decisions_decided_at ON public.drift_decisions USING btree (decided_at DESC)",
       "idx_drift_decisions_take": "CREATE INDEX idx_drift_decisions_take ON public.drift_decisions USING btree (take_id)",
+      "idx_embedding_cache_last_used": "CREATE INDEX idx_embedding_cache_last_used ON public.embedding_cache USING btree (last_used_at)",
       "idx_eval_candidates_created_at": "CREATE INDEX idx_eval_candidates_created_at ON public.eval_candidates USING btree (created_at DESC)",
       "idx_eval_capture_failures_ts": "CREATE INDEX idx_eval_capture_failures_ts ON public.eval_capture_failures USING btree (ts DESC)",
       "idx_extract_rollup_7d_day": "CREATE INDEX idx_extract_rollup_7d_day ON public.extract_rollup_7d USING btree (day)",
@@ -1074,6 +1086,8 @@
       "idx_takes_resolved_at": "CREATE INDEX idx_takes_resolved_at ON public.takes USING btree (resolved_at) WHERE (resolved_at IS NOT NULL)",
       "idx_takes_scorecard": "CREATE INDEX idx_takes_scorecard ON public.takes USING btree (holder, kind, resolved_quality) WHERE (resolved_quality IS NOT NULL)",
       "idx_takes_weight_active": "CREATE INDEX idx_takes_weight_active ON public.takes USING btree (weight DESC) WHERE active",
+      "idx_think_stream_jobs_expiry": "CREATE INDEX idx_think_stream_jobs_expiry ON public.think_stream_jobs USING btree (expires_at)",
+      "idx_think_stream_jobs_source": "CREATE INDEX idx_think_stream_jobs_source ON public.think_stream_jobs USING btree (source_id, created_at DESC)",
       "idx_timeline_date": "CREATE INDEX idx_timeline_date ON public.timeline_entries USING btree (date)",
       "idx_timeline_dedup": "CREATE UNIQUE INDEX idx_timeline_dedup ON public.timeline_entries USING btree (page_id, date, md5(summary), source)",
       "idx_timeline_event_dedup": "CREATE UNIQUE INDEX idx_timeline_event_dedup ON public.timeline_entries USING btree (event_page_id, date) WHERE (event_page_id IS NOT NULL)",
@@ -1266,6 +1280,7 @@
       "takes_resolved_at_idx": "CREATE INDEX takes_resolved_at_idx ON public.takes USING btree (resolved_at DESC) WHERE (resolved_at IS NOT NULL)",
       "think_ab_results_pkey": "CREATE UNIQUE INDEX think_ab_results_pkey ON public.think_ab_results USING btree (id)",
       "think_ab_results_recent_idx": "CREATE INDEX think_ab_results_recent_idx ON public.think_ab_results USING btree (source_id, ran_at DESC)",
+      "think_stream_jobs_pkey": "CREATE UNIQUE INDEX think_stream_jobs_pkey ON public.think_stream_jobs USING btree (id)",
       "timeline_entries_pkey": "CREATE UNIQUE INDEX timeline_entries_pkey ON public.timeline_entries USING btree (id)",
       "trust_allow_rules_active_idx": "CREATE INDEX trust_allow_rules_active_idx ON public.trust_allow_rules USING btree (source_id) WHERE (removed_at IS NULL)",
       "trust_allow_rules_active_unique": "CREATE UNIQUE INDEX trust_allow_rules_active_unique ON public.trust_allow_rules USING btree (source_id, COALESCE(uri_prefix, ''::text), COALESCE(reason_family, ''::text)) WHERE (removed_at IS NULL)",
@@ -1805,6 +1820,19 @@
           "7 decided_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
           "8 applied_at timestamp with time zone/timestamptz NULL",
           "9 applied_by text/text NULL"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "embedding_cache": {
+        "columns": [
+          "1 input_hash text/text NOT NULL",
+          "2 model text/text NOT NULL",
+          "3 dimensions integer/int4 NOT NULL",
+          "4 embedding USER-DEFINED/vector NULL",
+          "5 token_count integer/int4 NULL",
+          "6 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "7 last_used_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "8 hit_count integer/int4 NOT NULL DEFAULT 0"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },
@@ -3458,6 +3486,25 @@
           "8 preferred text/text NOT NULL",
           "9 model_id text/text NULL",
           "10 notes text/text NULL"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "think_stream_jobs": {
+        "columns": [
+          "1 id text/text NOT NULL",
+          "2 source_id text/text NULL",
+          "3 allowed_sources jsonb/jsonb NULL",
+          "4 status text/text NOT NULL DEFAULT 'running'::text",
+          "5 stream_offset integer/int4 NOT NULL DEFAULT 0",
+          "6 partial_answer text/text NOT NULL DEFAULT ''::text",
+          "7 retrieval jsonb/jsonb NULL",
+          "8 final_result jsonb/jsonb NULL",
+          "9 error_code text/text NULL",
+          "10 error_message text/text NULL",
+          "11 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "12 updated_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "13 finished_at timestamp with time zone/timestamptz NULL",
+          "14 expires_at timestamp with time zone/timestamptz NOT NULL DEFAULT (now() + '01:00:00'::interval)"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },

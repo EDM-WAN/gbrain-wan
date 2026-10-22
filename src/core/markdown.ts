@@ -459,7 +459,7 @@ export function resolveParsedSubtype(
  * file and keeps going instead of failing the whole sync. Defined once here;
  * managed and legacy sync, import and `validate --importable` share it.
  */
-export const HOLD_CODES = ['invalid_frontmatter', 'frontmatter_slug_conflict', 'file_too_large', 'rename_held', 'parser_regression'] as const;
+export const HOLD_CODES = ['invalid_frontmatter', 'frontmatter_slug_conflict', 'file_too_large', 'generated_data', 'rename_held', 'parser_regression'] as const;
 export type HoldCode = typeof HOLD_CODES[number];
 export const INVALID_FRONTMATTER_REASONS = ['yaml_parse', 'needs_interpretation', 'ambiguous_identity_key', 'ambiguous_protected_key'] as const;
 export type InvalidFrontmatterReason = typeof INVALID_FRONTMATTER_REASONS[number];

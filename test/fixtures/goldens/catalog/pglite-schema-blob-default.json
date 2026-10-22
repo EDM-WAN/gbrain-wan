@@ -32,6 +32,7 @@
       "derivation_inputs.derivation_inputs_pkey": "p PRIMARY KEY (derived_table, derived_id, input_table, input_id)",
       "derivation_inputs.derivation_inputs_source_id_fkey": "f FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE",
       "dream_synthesis_completions.dream_synthesis_completions_pkey": "p PRIMARY KEY (source_id, idempotency_key)",
+      "embedding_cache.embedding_cache_pkey": "p PRIMARY KEY (input_hash)",
       "eval_candidates.eval_candidates_detail_check": "c CHECK (((detail IS NULL) OR (detail = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text]))))",
       "eval_candidates.eval_candidates_detail_resolved_check": "c CHECK (((detail_resolved IS NULL) OR (detail_resolved = ANY (ARRAY['low'::text, 'medium'::text, 'high'::text]))))",
       "eval_candidates.eval_candidates_pkey": "p PRIMARY KEY (id)",
@@ -385,6 +386,9 @@
       "dream_synthesis_completions": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
+      "embedding_cache": [
+        "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
+      ],
       "eval_candidates": [
         "<current_role> -> <current_role> WITH GRANT OPTION: DELETE,INSERT,REFERENCES,SELECT,TRIGGER,TRUNCATE,UPDATE"
       ],
@@ -684,6 +688,7 @@
       "decision_receipts_slot_created_idx": "CREATE INDEX decision_receipts_slot_created_idx ON public.decision_receipts USING btree (slot, created_at)",
       "derivation_inputs_pkey": "CREATE UNIQUE INDEX derivation_inputs_pkey ON public.derivation_inputs USING btree (derived_table, derived_id, input_table, input_id)",
       "dream_synthesis_completions_pkey": "CREATE UNIQUE INDEX dream_synthesis_completions_pkey ON public.dream_synthesis_completions USING btree (source_id, idempotency_key)",
+      "embedding_cache_pkey": "CREATE UNIQUE INDEX embedding_cache_pkey ON public.embedding_cache USING btree (input_hash)",
       "eval_candidates_pkey": "CREATE UNIQUE INDEX eval_candidates_pkey ON public.eval_candidates USING btree (id)",
       "eval_capture_failures_pkey": "CREATE UNIQUE INDEX eval_capture_failures_pkey ON public.eval_capture_failures USING btree (id)",
       "eval_contradictions_cache_expires_idx": "CREATE INDEX eval_contradictions_cache_expires_idx ON public.eval_contradictions_cache USING btree (expires_at)",
@@ -718,6 +723,7 @@
       "idx_chunks_symbol_name": "CREATE INDEX idx_chunks_symbol_name ON public.content_chunks USING btree (symbol_name) WHERE (symbol_name IS NOT NULL)",
       "idx_cycle_locks_ttl": "CREATE INDEX idx_cycle_locks_ttl ON public.gbrain_cycle_locks USING btree (ttl_expires_at)",
       "idx_derivation_inputs_input": "CREATE INDEX idx_derivation_inputs_input ON public.derivation_inputs USING btree (input_table, input_id)",
+      "idx_embedding_cache_last_used": "CREATE INDEX idx_embedding_cache_last_used ON public.embedding_cache USING btree (last_used_at)",
       "idx_eval_candidates_created_at": "CREATE INDEX idx_eval_candidates_created_at ON public.eval_candidates USING btree (created_at DESC)",
       "idx_eval_capture_failures_ts": "CREATE INDEX idx_eval_capture_failures_ts ON public.eval_capture_failures USING btree (ts DESC)",
       "idx_files_hash": "CREATE INDEX idx_files_hash ON public.files USING btree (content_hash)",
@@ -1311,6 +1317,19 @@
           "1 source_id text/text NOT NULL",
           "2 idempotency_key text/text NOT NULL",
           "3 completed_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()"
+        ],
+        "flags": "relkind=r rls=false force_rls=false"
+      },
+      "embedding_cache": {
+        "columns": [
+          "1 input_hash text/text NOT NULL",
+          "2 model text/text NOT NULL",
+          "3 dimensions integer/int4 NOT NULL",
+          "4 embedding USER-DEFINED/vector NULL",
+          "5 token_count integer/int4 NULL",
+          "6 created_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "7 last_used_at timestamp with time zone/timestamptz NOT NULL DEFAULT now()",
+          "8 hit_count integer/int4 NOT NULL DEFAULT 0"
         ],
         "flags": "relkind=r rls=false force_rls=false"
       },

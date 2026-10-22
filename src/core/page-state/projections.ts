@@ -318,12 +318,14 @@ export async function resealSafeChunks(engine: BrainEngine, slug: string, source
   return { pendingChunks: Number(pending?.chunks ?? 0), pendingChars: Number(pending?.chars ?? 0) };
 }
 
-export async function preparePageProjection(prepared: ProjectionSnapshot) {
+export async function preparePageProjection(prepared: ProjectionSnapshot, opts: { engine?: BrainEngine } = {}) {
   const page = prepared.snapshot.page;
   if (prepared.pageKind === 'code') {
     const path = typeof page.frontmatter.file === 'string' ? page.frontmatter.file : page.source_path;
     if (!path) throw new Error('Code projection requires a recorded source path. Restore frontmatter.file or source_path before retrying.');
-    const code = await prepareCodeChunks(page, path);
+    // `engine` enables the cross-source embedding cache. Callers that cannot
+    // supply one still get correct chunks, just without pre-filled vectors.
+    const code = await prepareCodeChunks(page, path, opts);
     return { chunks: code.chunks, code };
   }
   if (prepared.pageKind !== 'markdown') throw new Error('This page kind requires its source importer.');

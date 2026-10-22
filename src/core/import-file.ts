@@ -19,15 +19,17 @@ import { classifyStoredType } from './schema-pack/type-usage.ts';
 import { prepareFenceAwareMarkdownChunks } from './markdown-chunks.ts';
 import { prepareCodeChunks, installCodeChunkEdges, mapCodeEdges } from './code-chunks.ts';
 import { detectCodeLanguage, CHUNKER_VERSION, GRAMMAR_REVISIONS, type SupportedCodeLanguage } from './chunkers/code.ts';
+import { classifyGeneratedDataFile, SAMPLE_BYTES as GENERATED_DATA_SAMPLE_BYTES } from './generated-data-file.ts';
 import { sanitizeRemoteBody } from './remote-body.ts';
-import { installPageEmbeddings, installPageProjection, preparePageProjection, projectionBelowSafeFence, queuePageProjection, readProjectionSnapshot, resealSafeChunks,
-  sealPageTextProjection, stampEmbeddingInputs, type ProjectionSnapshot } from './page-state/projections.ts';
+import { embeddingWriteTarget, installPageEmbeddings, installPageProjection, preparePageProjection, projectionBelowSafeFence, queuePageProjection,
+  readProjectionSnapshot, resealSafeChunks, sealPageTextProjection, stampEmbeddingInputs, type ProjectionSnapshot } from './page-state/projections.ts';
 import { sanitizeText } from './batch-rows.ts';
 import { hasProtectedBody, safeChunksFilter } from './search/safe-chunks.ts';
 import { planEmbeddingReuse } from './embed-reuse.ts';
+import { lookupEmbeddings, storeEmbeddings } from './embedding-cache.ts';
 import { reuseStoredChunkVectors } from './import-chunk-reuse.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
-import { embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
+import { embedMultimodal, currentEmbeddingSignature, getEmbeddingDimensions } from './embedding.ts';
 // #3374 — import-path embeds ride the shared retry loop (429 retry-after +
 // transient network backoff) instead of bare embedBatch, so one socket blip
 // mid-sync no longer aborts the whole file import. Same core→commands edge
@@ -97,6 +99,32 @@ function mergeHiddenFactRowsIntoBody(
   const gapWarning = factsGapWarning(slug, incomingFacts, existingFacts, false);
   if (gapWarning) console.warn(gapWarning);
   return incomingBody;
+}
+
+/**
+ * Cache key for code chunks, or null when no embedding is configured.
+ *
+ * Code chunks embed as raw text (`tier: 'none'`), so the provider input for a
+ * chunk IS its `chunk_text` — no wrapper to reproduce here. The per-page reuse
+ * gate wraps markdown; this path deliberately does not, which is why the two
+ * cannot share one key function.
+ */
+async function resolveCodeCacheKey(engine: BrainEngine): Promise<{ model: string; dimensions: number } | null> {
+  try {
+    const target = await embeddingWriteTarget(engine);
+    const model = target.provenanceModel ?? target.model;
+    // Dimensions must come from the CONFIGURED provider, not from the column
+    // descriptor: `normalizeEngineColumn` returns a hardcoded 1536 placeholder
+    // for the default `embedding` column (its own comment says the engine never
+    // reads it — the vector cast does). A brain running 2560-d vectors would
+    // therefore key every cache lookup at 1536 and never match a single row
+    // written by `embed-cache backfill`, which uses getEmbeddingDimensions().
+    const dimensions = getEmbeddingDimensions();
+    if (!model || !Number.isFinite(dimensions) || dimensions <= 0) return null;
+    return { model, dimensions };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1198,6 +1226,24 @@ export async function importCodeFile(
     return { slug, status: 'skipped', chunks: 0, error: `Code file too large (${byteLength} bytes)`, refusal: { code: 'file_too_large', message: `Code file too large (${byteLength} bytes)` }, skip_reason: 'file_too_large' };
   }
 
+  // Generated binary blobs wearing a source extension (LVGL image arrays,
+  // `xxd -i` output, lcdc pixel tables). Chunking them yields hex dumps the
+  // chunker cannot name — `declaration` chunks averaging 2.3 KB — and every
+  // one costs an embedding. Measured on the loong SDK: 344 files / 483 MiB,
+  // 46% of its source bytes. `skip_reason: 'generated_data'` is a CLASSIFIED
+  // skip, not a failure: sync/import keep it out of the failure ledger so a
+  // few hundred data blobs cannot fail an otherwise clean import. See
+  // core/generated-data-file.ts for the heuristic and its false-positive rate.
+  const generatedData = classifyGeneratedDataFile(content.slice(0, GENERATED_DATA_SAMPLE_BYTES), lang);
+  if (generatedData.generated) {
+    return {
+      slug, status: 'skipped', chunks: 0,
+      error: `Generated data blob (avg line ${Math.round(generatedData.avgLineChars)} chars, ${generatedData.definitions} definition(s)); not code`,
+      refusal: { code: 'generated_data', message: `Generated data blob skipped: ${relativePath}` },
+      skip_reason: 'generated_data',
+    };
+  }
+
   // Vendor-neutral guardrail seam (observe-only, fail-open). Runs AFTER the
   // code size guard, BEFORE hash compute, code-chunking, embedding, and DB
   // write. Verdict ignored by design; no-op when no guardrail is registered.
@@ -1246,7 +1292,7 @@ export async function importCodeFile(
   if (existing?.content_hash === hash && !existing.deleted_at && opts.noEmbed) {
     const snapshot = await readProjectionSnapshot(engine, slug, txOpts.sourceId, { allowUnsealed: true });
     if (!snapshot || snapshot.snapshot.revision !== existing.knowledge_revision) throw new Error('Code changed during import preparation. Retry the import.');
-    const projection = await preparePageProjection(snapshot);
+    const projection = await preparePageProjection(snapshot, { engine });
     const result: ImportResult = { slug, status: 'imported', chunks: projection.chunks.length };
     const apply = (tx: BrainEngine) => installPageProjection(tx, snapshot, projection.chunks,
       { seal: true, preserveEmbeddings: true, code: projection.code });
@@ -1263,7 +1309,7 @@ export async function importCodeFile(
   // from the chunker (nested methods carry ['ClassName'] etc.) so the
   // chunk-grain FTS trigger picks up scope for ranking and downstream
   // Layer 5 edge resolution can use scope-qualified identity.
-  const code = await prepareCodeChunks(parsedPage, relativePath);
+  const code = await prepareCodeChunks(parsedPage, relativePath, { engine });
   const { chunks, edges: extractedEdges } = code;
 
   // v0.19.0 E2 — incremental chunking. Embedding calls dominate the cost
@@ -1279,7 +1325,7 @@ export async function importCodeFile(
   const existingChunks = existing && !opts.noEmbed
     ? await engine.getChunks(slug, { sourceId: sourceId ?? 'default', includeEmbedding: true, requireSafeChunks: true })
     : [];
-  const { reuse, needsEmbedIndexes } = planEmbeddingReuse(existingChunks, chunks);
+  const { reuse, needsEmbedIndexes: afterPageReuse } = planEmbeddingReuse(existingChunks, chunks);
   for (const [i, matched] of reuse) {
     // Reuse the existing embedding verbatim. No API call, no cost. Carry the
     // stored model stamp with the vector so provenance survives a model swap.
@@ -1287,6 +1333,13 @@ export async function importCodeFile(
     chunks[i]!.token_count = matched.token_count ?? undefined;
     if (matched.model) chunks[i]!.model = matched.model;
   }
+
+  // Cross-source cache: filled inside prepareCodeChunks, which both this path
+  // and the coordinated `reindex-code` projection go through. Anything it
+  // already vectored is not this file's cost — drop it from the embed list so
+  // a --no-embed import leaves no stale work for the backfill.
+  const codeCacheKey = await resolveCodeCacheKey(engine);
+  const needsEmbedIndexes = afterPageReuse.filter((i) => !chunks[i]!.embedding);
 
   // Embed only the new/changed chunks.
   let codeEmbeddingFailed = false;
@@ -1298,6 +1351,15 @@ export async function importCodeFile(
         const i = needsEmbedIndexes[j]!;
         chunks[i]!.embedding = embeddings[j]!;
         chunks[i]!.token_count = Math.ceil(chunks[i]!.chunk_text.length / 4);
+      }
+      // Publish what the provider just computed so the next source (or the
+      // next chunker version) can skip the call. Best-effort by contract.
+      if (codeCacheKey) {
+        await storeEmbeddings(engine, codeCacheKey, needsEmbedIndexes.map((i) => ({
+          text: chunks[i]!.chunk_text,
+          embedding: chunks[i]!.embedding as Float32Array,
+          token_count: chunks[i]!.token_count ?? null,
+        })));
       }
     } catch (e: unknown) {
       codeEmbeddingFailed = true;

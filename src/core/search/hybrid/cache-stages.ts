@@ -252,6 +252,7 @@ export function semanticCacheSkipped(opts: HybridSearchOpts | undefined, semanti
     !semanticCache.cache.isEnabled() ||
     (opts?.walkDepth ?? 0) > 0 ||
     Boolean(opts?.nearSymbol) ||
+    (opts?.nearSymbols?.length ?? 0) > 0 ||
     semanticCache.isNonDefaultColumn ||
     opts?.dedupOpts !== undefined ||
     dateFiltered ||

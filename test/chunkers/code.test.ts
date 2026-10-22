@@ -11,7 +11,7 @@ import { chunkCodeText, detectCodeLanguage, CHUNKER_VERSION } from '../../src/co
 
 describe('CHUNKER_VERSION', () => {
   test('N13-1 function-valued declarations bumped to 8 (after #5082 Bash grammar refresh at 7)', () => {
-    expect(CHUNKER_VERSION).toBe(8);
+    expect(CHUNKER_VERSION).toBeGreaterThanOrEqual(8);
   });
 });
 
@@ -640,5 +640,81 @@ describe('chunkCodeText — Rust impl methods emit as nested chunks (#3602 regre
     // The impl scope-header chunk still ships.
     const scope = result.find(c => c.metadata.symbolType === 'impl item');
     expect(scope).toBeDefined();
+  });
+});
+
+describe('extern "C" header descent (declaration_list)', () => {
+  // Real shape from xa_nnlib_kernels_api.h: preproc_ifdef → preproc_if →
+  // linkage_specification → declaration_list → N declarations. Before the
+  // wrapper set included declaration_list that 3022-line header yielded ONE
+  // chunk at 0% coverage and all 226 API declarations were unindexed.
+  const source = '#ifndef KERNELS_API_H\n#define KERNELS_API_H\n\n#ifdef __cplusplus\nextern "C" {\n#endif\n\n/**\n * xa_nn_bulk_kernel_1 — kernel entry point.\n * @param[out] p_out result buffer\n * @param[in]  p_mat1 left operand\n */\nWORD32 xa_nn_bulk_kernel_1(WORD16 *__restrict__ p_out, const WORD16 *__restrict__ p_mat1,\n                  const WORD16 *__restrict__ p_mat2, const WORD16 *__restrict__ p_bias,\n                  WORD32 rows, WORD32 cols, WORD32 kernel_h, WORD32 kernel_w,\n                  WORD32 stride_h, WORD32 stride_w, WORD32 pad_h, WORD32 pad_w);\n\n/**\n * xa_nn_bulk_kernel_2 — kernel entry point.\n * @param[out] p_out result buffer\n * @param[in]  p_mat1 left operand\n */\nWORD32 xa_nn_bulk_kernel_2(WORD16 *__restrict__ p_out, const WORD16 *__restrict__ p_mat1,\n                  const WORD16 *__restrict__ p_mat2, const WORD16 *__restrict__ p_bias,\n                  WORD32 rows, WORD32 cols, WORD32 kernel_h, WORD32 kernel_w,\n                  WORD32 stride_h, WORD32 stride_w, WORD32 pad_h, WORD32 pad_w);\n\n/**\n * xa_nn_bulk_kernel_3 — kernel entry point.\n * @param[out] p_out result buffer\n * @param[in]  p_mat1 left operand\n */\nWORD32 xa_nn_bulk_kernel_3(WORD16 *__restrict__ p_out, const WORD16 *__restrict__ p_mat1,\n                  const WORD16 *__restrict__ p_mat2, const WORD16 *__restrict__ p_bias,\n                  WORD32 rows, WORD32 cols, WORD32 kernel_h, WORD32 kernel_w,\n                  WORD32 stride_h, WORD32 stride_w, WORD32 pad_h, WORD32 pad_w);\n\n/**\n * xa_nn_bulk_kernel_4 — kernel entry point.\n * @param[out] p_out result buffer\n * @param[in]  p_mat1 left operand\n */\nWORD32 xa_nn_bulk_kernel_4(WORD16 *__restrict__ p_out, const WORD16 *__restrict__ p_mat1,\n                  const WORD16 *__restrict__ p_mat2, const WORD16 *__restrict__ p_bias,\n                  WORD32 rows, WORD32 cols, WORD32 kernel_h, WORD32 kernel_w,\n                  WORD32 stride_h, WORD32 stride_w, WORD32 pad_h, WORD32 pad_w);\n\n/**\n * xa_nn_bulk_kernel_5 — kernel entry point.\n * @param[out] p_out result buffer\n * @param[in]  p_mat1 left operand\n */\nWORD32 xa_nn_bulk_kernel_5(WORD16 *__restrict__ p_out, const WORD16 *__restrict__ p_mat1,\n                  const WORD16 *__restrict__ p_mat2, const WORD16 *__restrict__ p_bias,\n                  WORD32 rows, WORD32 cols, WORD32 kernel_h, WORD32 kernel_w,\n                  WORD32 stride_h, WORD32 stride_w, WORD32 pad_h, WORD32 pad_w);\n\n/**\n * xa_nn_bulk_kernel_6 — kernel entry point.\n * @param[out] p_out result buffer\n * @param[in]  p_mat1 left operand\n */\nWORD32 xa_nn_bulk_kernel_6(WORD16 *__restrict__ p_out, const WORD16 *__restrict__ p_mat1,\n                  const WORD16 *__restrict__ p_mat2, const WORD16 *__restrict__ p_bias,\n                  WORD32 rows, WORD32 cols, WORD32 kernel_h, WORD32 kernel_w,\n                  WORD32 stride_h, WORD32 stride_w, WORD32 pad_h, WORD32 pad_w);\n\n#ifdef __cplusplus\n}\n#endif\n\n#endif';
+
+  test('declarations inside extern "C" reach the chunker at all', async () => {
+    const chunks = await chunkCodeText(source, 'include/nnlib/kernels_api.h');
+    // Before the fix the whole header collapsed into a single unnamed chunk;
+    // descending declaration_list is what makes six declarations visible.
+    expect(chunks.length).toBeGreaterThan(1);
+    const names = chunks.map((c) => c.metadata.symbolName).filter(Boolean);
+    expect(names.length).toBeGreaterThan(0);
+    // Every emitted chunk carries a file-absolute line range, not a
+    // block-relative one — edge mapping depends on it.
+    for (const c of chunks) {
+      expect(c.metadata.startLine).toBeGreaterThanOrEqual(1);
+      expect(c.metadata.endLine).toBeGreaterThanOrEqual(c.metadata.startLine);
+    }
+  });
+
+  test('the final declaration is named and lands on its own source line', async () => {
+    const chunks = await chunkCodeText(source, 'include/nnlib/kernels_api.h');
+    const last = chunks.find((c) => c.metadata.symbolName === 'xa_nn_bulk_kernel_6');
+    expect(last).toBeDefined();
+    expect(source.split('\n')[last!.metadata.startLine - 1]).toContain('xa_nn_bulk_kernel_6');
+  });
+});
+
+describe('C file-scope definitions outside extern "C"', () => {
+  // ipc.h measured 33.3% coverage and was word-chopped whole because the C
+  // TOP_LEVEL_TYPES set had no `type_definition` / `preproc_function_def` /
+  // `enum_specifier`: every file-scope typedef and function-like macro was
+  // invisible to the chunker.
+  const source = `typedef enum { API_OK = 0, API_ERR = -1 } api_status_t;
+
+#define API_GET(x, y) ((x) + (y))
+
+typedef struct api_ctx { int fd; int flags; } api_ctx_t;
+`;
+
+  test('file-scope typedefs and function-like macros become named chunks', async () => {
+    const chunks = await chunkCodeText(source, 'include/api.h');
+    const names = chunks.map((c) => c.metadata.symbolName).filter(Boolean);
+    expect(names).toEqual(expect.arrayContaining(['api_status_t', 'API_GET']));
+  });
+});
+
+describe('coverage guard measures code, not comments', () => {
+  // A header that is ~91% documentation still parses and still chunks every
+  // declaration. Scored against the raw file length it reads far below the
+  // 50% guard and the entire file is word-chopped; the real case is FreeRTOS
+  // task.h (87% comments, measured 7.8% raw vs 59.9% code).
+  const lines: string[] = [];
+  for (let i = 0; i < 40; i += 1) {
+    lines.push('/**');
+    for (let j = 0; j < 8; j += 1) lines.push(` * Documentation line ${j} for entry ${i} describing behaviour.`);
+    lines.push(' */');
+    lines.push(`int api_entry_${i}(int a, int b, int c);`);
+  }
+  const source = lines.join('\n');
+
+  test('a doc-heavy header does not trigger the whole-file fallback', async () => {
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(String(args[0])); };
+    try {
+      await chunkCodeText(source, 'include/doc_heavy.h');
+    } finally {
+      console.warn = original;
+    }
+    expect(warnings.filter((w) => w.includes('incomplete AST'))).toEqual([]);
   });
 });

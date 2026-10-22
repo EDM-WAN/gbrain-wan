@@ -81,6 +81,49 @@ test('queued import still hard-fails when rejections exceed the tolerance', () =
   await expect(handler(job)).rejects.toThrow(/Import failed for 6 file\(s\)/);
 }));
 
+test('a second import does not derive a duplicate embed job while one is in flight', () => isolated(async () => {
+  const srcDir = join(home, 'single-flight');
+  mkdirSync(srcDir, { recursive: true });
+  writeFileSync(join(srcDir, 'a.md'), '---\ntype: note\ntitle: Single flight A\n---\n\nBody A.\n');
+
+  // Earlier tests in this file derived their own embed jobs; start clean.
+  await engine.executeRaw(`DELETE FROM minion_jobs WHERE name = 'embed'`);
+  // An embed job for this source that can still do work.
+  await engine.executeRaw(
+    `INSERT INTO minion_jobs (submission_authority, name, status, data)
+     VALUES ('{"version":1,"kind":"application"}'::jsonb, 'embed', 'active', $1::jsonb)`,
+    [JSON.stringify({ sourceId: 'default', stale: true })],
+  );
+  await expect(handler(makeJob(20, { dir: srcDir, sourceId: 'default', noEmbed: true }))).resolves.toEqual({ imported: true });
+
+  const embedRows = await engine.executeRaw<{ n: number }>(
+    `SELECT count(*)::int AS n FROM minion_jobs WHERE name = 'embed' AND status = 'waiting'`,
+  );
+  // The in-flight job already covers these chunks — no second one is queued.
+  expect(embedRows[0]!.n).toBe(0);
+}));
+
+test('a live embed for another source does not suppress this source backfill', () => isolated(async () => {
+  const otherDir = join(home, 'other-source');
+  mkdirSync(otherDir, { recursive: true });
+  writeFileSync(join(otherDir, 'b.md'), '---\ntype: note\ntitle: Other B\n---\n\nBody B.\n');
+
+  await engine.executeRaw(`DELETE FROM minion_jobs WHERE name = 'embed'`);
+  await engine.executeRaw(
+    `INSERT INTO minion_jobs (submission_authority, name, status, data)
+     VALUES ('{"version":1,"kind":"application"}'::jsonb, 'embed', 'active', $1::jsonb)`,
+    [JSON.stringify({ sourceId: 'someone-else', stale: true })],
+  );
+  await expect(handler(makeJob(21, { dir: otherDir, sourceId: 'default', noEmbed: true }))).resolves.toEqual({ imported: true });
+
+  // Scoped embeds are per-source: another source's job must not stand in.
+  const rows = await engine.executeRaw<{ n: number }>(
+    `SELECT count(*)::int AS n FROM minion_jobs
+      WHERE name = 'embed' AND status = 'waiting' AND data->>'sourceId' = 'default'`,
+  );
+  expect(rows[0]!.n).toBe(1);
+}));
+
 test('repaired file imports cleanly on a fresh run', () => isolated(async () => {
   const repairDir = join(home, 'repair');
   mkdirSync(repairDir, { recursive: true });

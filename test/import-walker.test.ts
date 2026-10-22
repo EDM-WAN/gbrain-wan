@@ -132,3 +132,54 @@ describe('collectSyncableFiles — malformed-filename exclusion (both routes)', 
     expect(files).not.toContain(join(root, 'notes', '[wip] draft.md'));
   });
 });
+
+describe('repo-managed manifest workspace', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'gbrain-repo-ws-'));
+    // Root project: a plain git repo, exactly what `repo` checks out for the
+    // manifest's `<project path=".">`.
+    writeFileSync(join(root, 'root.c'), 'int root_fn(void) { return 1; }\n');
+    execSync('git init && git config user.email "t@t.com" && git config user.name "T" && git add -A && git commit -m x', { cwd: root, stdio: 'pipe' });
+    // Subproject: its own checkout with COMMITTED code, wired the way `repo`
+    // wires every non-root project (.git points into .repo/projects/<name>.git).
+    writeFileSync(join(root, 'sub.c'), 'int sub_only_symbol(void) { return 2; }\n');
+    mkdirSync(join(root, 'sub'));
+    writeFileSync(join(root, 'sub', 'leaf.c'), 'int leaf_symbol(void) { return 3; }\n');
+    execSync('git init && git config user.email "t@t.com" && git config user.name "T" && git add -A && git commit -m x', { cwd: join(root, 'sub'), stdio: 'pipe' });
+    // The structural marker: presence of .repo is what routes away from git.
+    mkdirSync(join(root, '.repo'));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test('walks the tree instead of trusting the root git listing', () => {
+    // The bug: `git ls-files` at the root lists ONLY root.c — the subproject's
+    // files are invisible because they belong to a different repository. An
+    // import routed through it indexed one project and silently dropped every
+    // other one. Measured on the sdk manifest: 33 661 root files, 0 from
+    // component/application/azure, component/tflite_micro and tools/ats.
+    const gitView = execSync('git ls-files', { cwd: root, encoding: 'utf8' }).split('\n').filter(Boolean);
+    expect(gitView).not.toContain('sub/leaf.c');
+
+    const files = collectSyncableFiles(root, { strategy: 'code' });
+    expect(files).toContain(join(root, 'root.c'));
+    expect(files).toContain(join(root, 'sub.c'));
+    expect(files).toContain(join(root, 'sub', 'leaf.c'));
+  });
+
+  test('a plain git repo keeps the git ignore-respecting fast path', () => {
+    // Guard against over-reach: the carve-out is keyed on .repo, so an
+    // ordinary checkout must still honor .gitignore.
+    rmSync(join(root, '.repo'), { recursive: true, force: true });
+    mkdirSync(join(root, 'sub'), { recursive: true });
+    writeFileSync(join(root, '.gitignore'), 'ignored.c\n');
+    writeFileSync(join(root, 'ignored.c'), 'int ignored(void) { return 0; }\n');
+    const files = collectSyncableFiles(root, { strategy: 'code' });
+    expect(files).toContain(join(root, 'root.c'));
+    expect(files).not.toContain(join(root, 'ignored.c'));
+  });
+});

@@ -177,6 +177,18 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   embedding_multimodal  vector(1024)
 );
 
+CREATE TABLE IF NOT EXISTS embedding_cache (
+  input_hash   TEXT        PRIMARY KEY,
+  model        TEXT        NOT NULL,
+  dimensions   INTEGER     NOT NULL,
+  embedding    vector(1536),
+  token_count  INTEGER,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  hit_count    INTEGER     NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_embedding_cache_last_used ON embedding_cache(last_used_at);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_page_index ON content_chunks(page_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_chunks_page ON content_chunks(page_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (embedding vector_cosine_ops);

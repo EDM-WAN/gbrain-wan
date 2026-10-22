@@ -145,7 +145,24 @@ import G_ZIG from '../../assets/wasm/grammars/tree-sitter-zig.wasm' with { type:
 // v9: 覆盖率兜底 —— tree-sitter 对「整文件被 #ifdef 包裹」的 C 源码只解析出头部
 // `#include`，余下上千行静默丢失（chunk 覆盖不足）。现在覆盖不到 50% 时回退到
 // 递归分片。分片结果对这类文件完全不同，bump 让存量页面在下一次 sync 时重切。
-export const CHUNKER_VERSION = 9;
+// v10: cAST 式结构分片 —— 语义节点采集现在会穿透 preproc_if/ERROR 等透明包装
+// 节点（整文件被 `#if defined(CONFIG_X)` 包住的 C 源码此前只切出 `#include`），
+// 并对主解析覆盖不到的长片段做「掩掉预处理指令后重新解析」的恢复，最后把
+// 所有未被覆盖的片段补成 module 块。分片边界与 chunk 清单对所有 C/C++ 及
+// 含条件编译的文件都变了，bump 让存量页面重切。
+// v11: `declaration_list` / `field_declaration_list` are descended as
+// transparent wrappers — an `extern "C" { … }` header (xa_nnlib's 3022-line
+// kernels API) collapsed to one unnamed chunk at 0% coverage and every
+// declaration in it was unindexed. Normal .c/.cpp sources measured unchanged.
+// v12: three coverage/omission fixes. (a) C/C++ `TOP_LEVEL_TYPES` gain
+// `type_definition`, `preproc_function_def`, `enum_specifier`,
+// `union_specifier` (and `type_alias_declaration` for C++) — file-scope
+// typedefs and function-like macros were never chunked, which alone pushed
+// ipc.h to 33% coverage and a whole-file word chop. (b) The coverage guard
+// measures against CODE chars, not the raw file, so a doc-comment-heavy
+// header (task.h: 87% comments) stops being mistaken for a failed parse.
+// (c) gap-fill skips stretches that are >75% comment lines.
+export const CHUNKER_VERSION = 12;
 /**
  * Per-language chunker revisions (a grammar swap or a language-specific emission rule), folded into that language's
  * code-file hash and into `chunkerStamp()`: a change re-chunks only its own language's files instead of every code
@@ -436,11 +453,27 @@ const TOP_LEVEL_TYPES: Partial<Record<SupportedCodeLanguage, Set<string>>> = {
     'struct_declaration', 'enum_declaration', 'namespace_declaration',
     'file_scoped_namespace_declaration', 'using_directive', 'property_declaration',
   ]),
+  // Same omissions as C above: `typedef`/`using` at file scope and function-
+  // like macros are named definitions, and a translation unit built out of
+  // them (flatbuffers' flatbuffer_builder.h, 25 unnamed chunks) never reached
+  // the 50% coverage guard's threshold without them.
   cpp: new Set([
     'function_definition', 'class_specifier', 'struct_specifier',
     'namespace_definition', 'declaration', 'template_declaration',
+    'type_definition', 'preproc_function_def', 'enum_specifier',
+    'union_specifier', 'type_alias_declaration',
   ]),
-  c: new Set(['function_definition', 'struct_specifier', 'declaration', 'preproc_def', 'preproc_include']),
+  // `type_definition` was missing, so every `typedef …;` at file scope was
+  // invisible: inside an `extern "C"` header a typedef is a named chunk, and
+  // without it files like ipc.h fell below the 50% coverage guard and were
+  // word-chopped wholesale (measured: 33.3% -> 81.0% coverage with it).
+  // `preproc_function_def` (`#define F(x) …`) is the same class of omission —
+  // a named macro definition tree-sitter produces as its own top-level node.
+  c: new Set([
+    'function_definition', 'struct_specifier', 'declaration', 'preproc_def',
+    'preproc_include', 'type_definition', 'preproc_function_def',
+    'enum_specifier', 'union_specifier',
+  ]),
   php: new Set([
     'function_definition', 'class_declaration', 'interface_declaration',
     'method_declaration', 'trait_declaration',
@@ -806,7 +839,7 @@ async function chunkParsedLanguage(
 
     const root = (tree as any).rootNode;
     const topLevelTypes = TOP_LEVEL_TYPES[language]!;
-    const semanticNodes = root.namedChildren.filter((n: any) => topLevelTypes.has(n.type) || moduleStatementSymbol(n, language) !== null);
+    const semanticNodes = collectSemanticNodes(root, topLevelTypes, language);
 
     if (semanticNodes.length === 0) {
       return { chunks: fallbackChunks(source, filePath, language, opts), edges: [] };
@@ -814,11 +847,14 @@ async function chunkParsedLanguage(
 
     const chunks: CodeChunk[] = [];
     const nestedConfig = NESTED_EMIT_CONFIG[language];
+    /** Absolute [start,end) ranges already turned into chunks — the recovery
+     *  pass uses these to skip nodes the primary parse already emitted. */
+    const emittedRanges: Array<[number, number]> = [];
 
-    for (const node of semanticNodes) {
+    const emitSemanticNode = (node: any): void => {
       const endNode = chunkEndNode(node, language);
       const nodeText = source.slice(node.startIndex, endNode.endIndex).trim();
-      if (!nodeText) continue;
+      if (!nodeText) return;
 
       // v0.20.0 Cathedral II Layer 6 (A3): for class/module/impl nodes,
       // emit the parent AND each child method as its own chunk with
@@ -852,7 +888,10 @@ async function chunkParsedLanguage(
       if (nestableNode && symbolName && nestedConfig) {
         const before = chunks.length;
         emitNestedScoped(nestableNode, [], source, filePath, language, nestedConfig, chunks);
-        if (chunks.length > before) continue;
+        if (chunks.length > before) {
+          emittedRanges.push([node.startIndex, endNode.endIndex]);
+          return;
+        }
       }
 
       if (estimateTokens(nodeText) <= largeThreshold) {
@@ -865,7 +904,8 @@ async function chunkParsedLanguage(
         });
         if (declaresFunctionValue(typeNode)) chunk.metadata.definesFunction = true;
         chunks.push(chunk);
-        continue;
+        emittedRanges.push([node.startIndex, endNode.endIndex]);
+        return;
       }
 
       // Split very large nodes at nested block boundaries
@@ -878,7 +918,8 @@ async function chunkParsedLanguage(
           index: chunks.length,
           parentSymbolPath: [],
         }));
-        continue;
+        emittedRanges.push([node.startIndex, endNode.endIndex]);
+        return;
       }
 
       for (const range of subRanges) {
@@ -891,7 +932,30 @@ async function chunkParsedLanguage(
           parentSymbolPath: [],
         }));
       }
+      emittedRanges.push([node.startIndex, endNode.endIndex]);
+    };
+
+    for (const node of semanticNodes) emitSemanticNode(node);
+
+    // Parse-recovery pass: a file whose conditional structure defeats the
+    // grammar (fatfs ff.c: one unbalanced `#else` collapsed 192K chars into a
+    // single ERROR node) emits almost nothing from the primary tree. Re-parse
+    // ONLY the uncovered stretches with preprocessor directive lines blanked
+    // out — same byte length, so offsets stay absolute and the nodes land on
+    // the right lines. Masking the directives is what repairs the structure:
+    // the grammar then sees plain C and recovers the function bodies.
+    for (const node of recoverUncoveredNodes(parser, source, language, topLevelTypes, emittedRanges, timeoutMs)) {
+      emitSemanticNode(node);
     }
+
+    // Gap-fill pass: the AST is not a partition — nodes leave stretches
+    // between them (leading license headers, an `#endif` tail, anything the
+    // grammar dropped mid-file). Word chunking used to fold that text into
+    // its sliding windows, so dropping it here would be a content REGRESSION
+    // even while symbol coverage improves (measured: stb_image.h 111.8% ->
+    // 77.5%). Emit each remaining stretch as an unnamed `module` chunk so the
+    // text stays indexed and the coverage guard below stops firing.
+    emitUncoveredGaps(source, filePath, language, emittedRanges, chunks, chunkTarget);
 
     // v0.20.0 Cathedral II Layer 5 (A1): harvest call-graph edges from the
     // tree before we delete it. The extractor is iterative (no recursion);
@@ -932,11 +996,20 @@ async function chunkParsedLanguage(
       // 覆盖率被虚高，短文件路径下会漏判（实测同一文件：短路径 48.2% 触发回退，
       // 长路径 52.7% 不触发）。
       const coveredChars = chunks.reduce((sum, c) => sum + stripChunkHeader(c.text).length, 0);
-      if (coveredChars < source.length * 0.5) {
+      // Measure against the file's CODE, not its raw length. A doc-comment
+      // heavy header (asr_interface.h: 73% comment lines) reads as 20.8%
+      // covered against the whole file and gets word-chopped, even though
+      // every declaration in it was chunked (78.0% of the code). Comments
+      // are not semantic units here — they ride along inside the chunks that
+      // contain them, or come back through the gap-fill pass.
+      const commentChars = countCommentChars(root);
+      const codeChars = Math.max(1, source.length - commentChars);
+      const coverage = coveredChars / codeChars;
+      if (coverage < 0.5) {
         console.warn(
           `[gbrain chunker] incomplete AST for ${filePath}: chunks cover ` +
-          `${coveredChars} of ${source.length} chars (${((coveredChars / source.length) * 100).toFixed(1)}%); ` +
-          `falling back to recursive chunks`,
+          `${coveredChars} of ${codeChars} code chars (${(coverage * 100).toFixed(1)}%, ` +
+          `${commentChars} in comments); falling back to recursive chunks`,
         );
         return { chunks: fallbackChunks(source, filePath, language, opts), edges: rawEdges };
       }
@@ -956,6 +1029,289 @@ async function chunkParsedLanguage(
     try { parser?.delete?.(); } catch { /* ignore double-delete */ }
   }
 }
+
+/**
+ * Transparent wrapper node types — conditionals and error recovery that
+ * tree-sitter interposes between the root and the semantic nodes we want.
+ *
+ * A Realtek C source whose entire body sits inside `#if defined(CONFIG_X)`
+ * parses as ONE `preproc_if` at the root; its 40 `function_definition`
+ * children are invisible to a root-level scan, so the file chunked to a
+ * single `#include` and the coverage guard below fell back to word
+ * chopping for the whole file (measured: rtk_coex.c, 0.5% covered). Same
+ * for `#ifdef`-gated headers (`preproc_ifdef`) and files mbedtls/psa
+ * guard wholesale. `ERROR` is included because a single unbalanced
+ * `#else` makes tree-sitter wrap the rest of the file in one recovery
+ * node — refusing to descend there costs the file's entire remainder.
+ *
+ * Only these wrapper kinds are descended. A named node that is NOT a
+ * wrapper is a real construct: descending into it would emit anonymous
+ * fragments of a function body as top-level chunks.
+ */
+const TRANSPARENT_WRAPPER_TYPES = new Set([
+  'preproc_if', 'preproc_ifdef', 'preproc_else', 'preproc_elif',
+  'preproc_elifdef', 'preproc_elifndef', 'preproc_defined',
+  'linkage_specification', 'ERROR',
+  // `declaration_list` is what `linkage_specification` holds for an
+  // `extern "C" { … }` block — the shape every C API header uses. Without
+  // descending into it the whole block reads as one unnamed node: xa_nnlib's
+  // 3022-line kernels header yielded ONE chunk at 0% coverage, hiding all 226
+  // function declarations. With it the same file yields 249 named nodes at
+  // 93.5% coverage, and measured normal sources (tasks.c, ssl_tls.c) are
+  // completely unchanged.
+  'declaration_list',
+  // C++ `class { … }` / `struct { … }` members.
+  'field_declaration_list',
+]);
+
+/**
+ * Collect the file's semantic nodes, descending through transparent
+ * wrappers (see TRANSPARENT_WRAPPER_TYPES) but stopping at the first real
+ * semantic node. Order is source order so chunk_index stays monotonic.
+ */
+function collectSemanticNodes(root: any, topLevelTypes: Set<string>, language: SupportedCodeLanguage): any[] {
+  const out: any[] = [];
+  const visit = (node: any): void => {
+    for (const child of node.namedChildren) {
+      if (topLevelTypes.has(child.type) || moduleStatementSymbol(child, language) !== null) {
+        out.push(child);
+      } else if (TRANSPARENT_WRAPPER_TYPES.has(child.type)) {
+        visit(child);
+      }
+    }
+  };
+  visit(root);
+  return out;
+}
+
+/**
+ * Total characters the parse classified as comments (any depth).
+ *
+ * Used to size the coverage guard's denominator: a header that is 87%
+ * doc-comment (FreeRTOS task.h) can cover every declaration it has and still
+ * read as "7.8% covered" against its raw length.
+ */
+function countCommentChars(root: any): number {
+  let total = 0;
+  const visit = (node: any): void => {
+    for (const child of node.namedChildren) {
+      if (child.type === 'comment') total += child.endIndex - child.startIndex;
+      else visit(child);
+    }
+  };
+  visit(root);
+  return total;
+}
+
+/** Minimum uncovered stretch worth a second parse. Below this the recovery
+ *  pass cannot pay for itself: comments and trailing `#endif` lines are the
+ *  normal remainder and never contain a definition. */
+const RECOVERY_MIN_GAP_CHARS = 4096;
+
+/** Cap on re-parses per file. Each one is a full WASM parse; a badly broken
+ *  file should degrade to a handful of recoveries, not dozens. */
+const RECOVERY_MAX_GAPS = 8;
+
+/** How deep the rebuilt (gap-relative) node tree is materialized. Chunking
+ *  only inspects a few levels (symbol name/type, a body's direct children),
+ *  and every level costs an object per named child. */
+const MAX_RECOVERED_DEPTH = 6;
+
+/**
+ * Find the stretches of `source` not covered by `emittedRanges`, re-parse each
+ * one with preprocessor directive lines blanked, and return the semantic nodes
+ * it yields that fit entirely inside that stretch.
+ *
+ * Geometry-preserving by construction: the mask replaces each directive with
+ * spaces of the same length (newlines preserved), so the re-parsed tree's
+ * indices are offsets in the ORIGINAL source. Nodes that overrun their gap are
+ * dropped — a node whose range crosses already-emitted content would duplicate
+ * it, and `mapCodeEdges` resolves call sites by line.
+ *
+ * Fail-open: any parse error returns what was collected so far. Recovery is an
+ * optimization on top of the primary tree, never a reason to fail a file.
+ */
+function recoverUncoveredNodes(
+  parser: any,
+  source: string,
+  language: SupportedCodeLanguage,
+  topLevelTypes: Set<string>,
+  emittedRanges: Array<[number, number]>,
+  timeoutMs: number,
+): any[] {
+  if (emittedRanges.length === 0) return [];
+  const sorted = [...emittedRanges].sort((a, b) => a[0] - b[0]);
+  const gaps: Array<[number, number]> = [];
+  let cursor = 0;
+  for (const [start, end] of sorted) {
+    if (start > cursor) gaps.push([cursor, start]);
+    cursor = Math.max(cursor, end);
+  }
+  if (cursor < source.length) gaps.push([cursor, source.length]);
+
+  const out: any[] = [];
+  let reparsed = 0;
+  for (const [gapStart, gapEnd] of gaps.sort((a, b) => (b[1] - b[0]) - (a[1] - a[0]))) {
+    if (gapEnd - gapStart < RECOVERY_MIN_GAP_CHARS) continue;
+    if (reparsed >= RECOVERY_MAX_GAPS) break;
+    reparsed++;
+    try {
+      const masked = maskPreprocessorDirectives(source.slice(gapStart, gapEnd));
+      const tree = parseWithTimeout(parser as ParserLike, masked, timeoutMs, `${language}:recovery@${gapStart}`);
+      const root = (tree as any).rootNode;
+      for (const node of collectSemanticNodes(root, topLevelTypes, language)) {
+        // A node that overruns its gap would duplicate content the primary
+        // pass already emitted (and mapCodeEdges would land its call sites on
+        // the wrong chunk). Drop it rather than clip it.
+        if (gapStart + node.endIndex > gapEnd) continue;
+        out.push(offsetNode(node, source, gapStart, rowOffsetAt(source, gapStart)));
+      }
+      try { tree?.delete?.(); } catch { /* ignore double-delete */ }
+    } catch {
+      // Timeout or parse failure on this stretch — keep what we have.
+    }
+  }
+  return out;
+}
+
+/** A leftover stretch shorter than this is left out entirely rather than
+ *  becoming its own row: a Go `package p` clause or a trailing `#endif` is
+ *  not worth an embedding call, and `module` must not name it (#5001). */
+const GAP_FILL_MIN_CHARS = 400;
+
+/**
+ * Emit the stretches no semantic node covered as unnamed `module` chunks
+ * (and fold short ones into the preceding chunk's text).
+ *
+ * These are the file's leading license header, trailing `#endif`s, and
+ * whatever the grammar abandoned — content that word chunking used to
+ * sample and AST chunking would otherwise silently drop. Named chunks keep
+ * their symbol identity; these are explicitly `module`, which is also what
+ * keeps `code-def` from inventing a symbol for them.
+ */
+function emitUncoveredGaps(
+  source: string,
+  filePath: string,
+  language: SupportedCodeLanguage,
+  emittedRanges: Array<[number, number]>,
+  chunks: CodeChunk[],
+  chunkTarget: number,
+): void {
+  if (chunks.length === 0) return;
+  const sorted = [...emittedRanges].sort((a, b) => a[0] - b[0]);
+  const gaps: Array<[number, number]> = [];
+  let cursor = 0;
+  for (const [start, end] of sorted) {
+    if (start > cursor) gaps.push([cursor, start]);
+    cursor = Math.max(cursor, end);
+  }
+  if (cursor < source.length) gaps.push([cursor, source.length]);
+
+  for (const [start, end] of gaps) {
+    const text = source.slice(start, end).trim();
+    if (!text) continue;
+    // Short remainders are the normal by-product of AST chunking: a Go
+    // `package p` clause, a license header, a trailing `#endif`. They carry
+    // no definition and turning them into rows invents `module` chunks the
+    // inventory tests (rightly) reject — #5001 keeps `module` meaning "a
+    // top-level call statement". Drop them; the long ones below are the ones
+    // that used to carry real lost content.
+    if (text.length < GAP_FILL_MIN_CHARS) continue;
+    // A gap that is almost entirely comment is a license header, a doc block
+    // the grammar left outside any declaration, or the prose between API
+    // entries. Emitting it as a `module` chunk costs an embedding and returns
+    // nothing a code query can use — measured on dsp's doc-heavy headers, 64
+    // of the 72 remaining unnamed module chunks were this shape. Keep a gap
+    // only when it carries enough code to be worth a row.
+    if (commentLineRatio(text) > 0.75) continue;
+    const startLine = rowOffsetAt(source, start) + 1;
+    for (const piece of recursiveChunk(text, { chunkSize: chunkTarget, chunkOverlap: 0 })) {
+      chunks.push(buildChunk({
+        body: piece.text, filePath, language,
+        symbolName: null, symbolType: 'module',
+        startLine, endLine: startLine + countLines(piece.text) - 1,
+        index: chunks.length,
+      }));
+    }
+  }
+}
+
+/** Fraction of non-blank lines that open or continue a `//`, `/*` or `*`
+ *  comment. Line-based on purpose: the gap text has no AST to consult. */
+function commentLineRatio(text: string): number {
+  let comment = 0;
+  let total = 0;
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    total++;
+    if (t.startsWith('//') || t.startsWith('/*') || t.startsWith('*') || t.startsWith('*/')) comment++;
+  }
+  return total === 0 ? 0 : comment / total;
+}
+
+/** Replace `#...` directive runs with spaces, preserving length and newlines. */
+function maskPreprocessorDirectives(text: string): string {
+  return text.replace(/^[ \t]*#[^\r\n]*/gm, (m) => ' '.repeat(m.length));
+}
+
+function rowOffsetAt(source: string, index: number): number {
+  let rows = 0;
+  for (let i = 0; i < index && i < source.length; i++) if (source.charCodeAt(i) === 10) rows++;
+  return rows;
+}
+
+/**
+ * Re-anchor a node from a gap-relative parse onto the original source.
+ *
+ * Indices shift by `gapStart`; rows shift by the gap's row offset (columns do
+ * not — the gap starts at a line boundary). Child nodes are rebuilt lazily
+ * from a bounded list so `namedChildren` keeps working for `chunkEndNode`
+ * (Dart signatures), `splitLargeNode`, and the child-type scans, but the
+ * tree-sitter handle itself is never retained: the tree is deleted after the
+ * loop and a live handle would dangle into WASM memory.
+ */
+function offsetNode(node: any, source: string, gapStart: number, rowDelta: number, depth: number = 0): any {
+  const fetchChild = (c: any): any => offsetNode(c, source, gapStart, rowDelta, depth + 1);
+  const children = depth < MAX_RECOVERED_DEPTH
+    ? Array.from(node.namedChildren ?? [], fetchChild)
+    : [];
+  const relocated: any = {
+    type: node.type,
+    startIndex: gapStart + node.startIndex,
+    endIndex: gapStart + node.endIndex,
+    startPosition: { row: node.startPosition.row + rowDelta, column: node.startPosition.column },
+    endPosition: { row: node.endPosition.row + rowDelta, column: node.endPosition.column },
+    namedChildren: children,
+    namedChildCount: children.length,
+    isExtra: node.isExtra,
+    // extractSymbolName reads `.text` off the name node; the source slice is
+    // the only thing that survives after the tree is deleted.
+    get text(): string { return source.slice(this.startIndex, this.endIndex); },
+  };
+  // `childForFieldName` drives extractSymbolName (name/declaration/declarator/
+  // definition) and splitLargeNode (body). Resolve every field EAGERLY, here,
+  // while the tree is still alive: the caller deletes it as soon as the gap
+  // loop finishes, and a lazy closure would then call into freed WASM memory
+  // ("Out of bounds memory access", measured on zephyr's fff.h).
+  const fields = new Map<string, any>();
+  const byOriginal = new Map<any, any>();
+  if (depth < MAX_RECOVERED_DEPTH) {
+    const originals: any[] = Array.from(node.namedChildren ?? []);
+    children.forEach((c: any, i: number) => { if (originals[i]) byOriginal.set(originals[i], c); });
+  }
+  for (const fieldName of RECOVERED_FIELD_NAMES) {
+    const original = typeof node.childForFieldName === 'function' ? node.childForFieldName(fieldName) : null;
+    if (!original) continue;
+    fields.set(fieldName, byOriginal.get(original) ?? fetchChild(original));
+  }
+  relocated.childForFieldName = (name: string): any => fields.get(name) ?? null;
+  return relocated;
+}
+
+/** The field names `extractSymbolName`, `unwrapDecorated` and `splitLargeNode`
+ *  read off a node. Eager resolution in `offsetNode` needs the full list. */
+const RECOVERED_FIELD_NAMES = ['name', 'declaration', 'declarator', 'definition', 'body'] as const;
 
 /**
  * Post-pass that merges adjacent small chunks into larger chunks up to

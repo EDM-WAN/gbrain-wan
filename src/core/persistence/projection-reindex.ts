@@ -32,7 +32,7 @@ export async function prepareCodeReindex(engine: BrainEngine, row: WriteRequest)
       { fix: pageFix(row.source_id, row.slug) });
   }
   const noop = row.intent.force !== true && prepared.snapshot.page.text_projection_revision === prepared.snapshot.revision;
-  const projection = noop ? undefined : await preparePageProjection(prepared);
+  const projection = noop ? undefined : await preparePageProjection(prepared, { engine });
   return { observedRevision: prepared.snapshot.revision, noop, deferEmbedding: true, apply: async tx => {
     if (projection) await installPageProjection(tx, prepared, projection.chunks, { seal: true, preserveEmbeddings: true, code: projection.code });
     return { status: noop ? 'skipped' : 'imported', chunks: projection?.chunks.length ?? 0, noop };
@@ -72,7 +72,7 @@ export async function reindexCodeProjection(engine: BrainEngine, slug: string, s
       if (!prepared || prepared.snapshot.revision !== snapshot.snapshot.revision || prepared.snapshot.page.id !== snapshot.snapshot.page.id
         || prepared.snapshot.sourceIncarnation !== snapshot.snapshot.sourceIncarnation) throw new PageRevisionConflictError(snapshot.snapshot.revision, prepared?.snapshot.revision ?? null);
       if (!opts.force && prepared.snapshot.page.text_projection_revision === prepared.snapshot.revision) return { status: 'skipped' as const, chunks: 0 };
-      const projection = await preparePageProjection(prepared);
+      const projection = await preparePageProjection(prepared, { engine });
       await installPageProjection(engine, prepared, projection.chunks, { seal: true, preserveEmbeddings: true, code: projection.code });
       return { status: 'imported' as const, chunks: projection.chunks.length };
     });

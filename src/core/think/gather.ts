@@ -25,7 +25,8 @@ import type { Page, SearchResult } from '../types.ts';
 import { DEFAULT_PAGES_BUDGET, PAGES_BLOCK_EXCERPT_FLOOR_CHARS, type PagesBudget } from './pages-budget.ts';
 import { filterPagesToWindow, type TemporalWindow } from './temporal-window.ts';
 import { pageContentDate } from './temporal-context.ts';
-import { sanitizeQueryForPrompt } from '../search/expansion.ts';
+import { sanitizeQueryForPrompt, expandQuery } from '../search/expansion.ts';
+import { expandQueryForCode } from '../search/code-expansion.ts';
 import { cleanThinkRetrievalQuery, isExactTitleMatch } from './retrieval-query.ts';
 import { ensureWellFormed } from '../text-safe.ts';
 import { CJK_SLUG_CHARS } from '../cjk.ts';
@@ -49,6 +50,197 @@ interface IndexedCodeContextRow {
 }
 
 const INDEXED_HELPER_LIMIT = 8;
+
+/** Cap on pages pulled in by an explicitly named file. A question names one
+ *  or two files; anything past this is an accidental match, not an answer. */
+const EXPLICIT_FILE_LIMIT = 4;
+
+/**
+ * Pages whose source path ENDS WITH a file the question names.
+ *
+ * `selectCodeFocusHits` re-ranks the pages hybrid already returned, so a
+ * question that names its file ("why does example_idma.c use DiagPrintf")
+ * could only ever be answered from whatever semantic search happened to rank
+ * — measured on a real dsp question, the file it named was never in the
+ * candidate set at all and the answer came from a different file. This is the
+ * deterministic leg that makes a named file reachable regardless of ranking.
+ *
+ * Matching is on the path SUFFIX, not the slug: the question gives a bare
+ * basename, while the stored path carries the whole tree below the source
+ * root. Suffix-match on '/name.ext' keeps `loguart.c` from matching
+ * `my_loguart.c`. Slugs are the fallback for pages whose frontmatter lost its
+ * `file` key (`slugifyCodePath` turns `a/b/c.c` into `...-a-b-c-c`).
+ */
+async function findPagesByFileName(
+  engine: BrainEngine,
+  fileNames: string[],
+  opts: Pick<ThinkGatherOpts, 'sourceId' | 'sourceIds'>,
+): Promise<SearchResult[]> {
+  const names = Array.from(new Set(fileNames.map((n) => n.trim()).filter(Boolean))).slice(0, 4);
+  if (names.length === 0) return [];
+  // Exact suffix via `right(path, n)` rather than LIKE: a C identifier is
+  // full of `_`, and `_` is LIKE's single-character wildcard, so
+  // `ameba_gpio_rom.c` would also match `amebaXgpioXrom.c`.
+  const params: unknown[] = [
+    names.map((n) => `/${n}`),
+    names.map((n) => n.length + 1),
+    // Regex rather than LIKE: `LIKE ANY (...) ESCAPE` is rejected by the
+    // PGLite parser, and an unescaped `_` in an identifier is a wildcard.
+    names.map((n) => `${regexEscape(codeFileMarker(n))}$`),
+  ];
+  let sourcePredicate = '';
+  const { sourceId, sourceIds } = resolveThinkSourceScope(opts);
+  if (sourceIds && sourceIds.length > 0) {
+    params.push(sourceIds);
+    sourcePredicate = `AND p.source_id = ANY($${params.length}::text[])`;
+  } else if (sourceId) {
+    params.push(sourceId);
+    sourcePredicate = `AND p.source_id = $${params.length}`;
+  }
+  const rows = await engine.executeRaw<{ slug: string; source_id: string }>(
+    `SELECT p.slug, p.source_id
+       FROM pages p
+      WHERE p.page_kind = 'code'
+        AND p.deleted_at IS NULL
+        AND (
+          EXISTS (
+            SELECT 1 FROM unnest($1::text[], $2::int[]) AS f(suffix, suffix_len)
+             WHERE right(COALESCE(p.frontmatter->>'file', ''), f.suffix_len) = f.suffix
+          )
+          OR p.slug ~ ANY($3::text[])
+        )
+        ${sourcePredicate}
+      ORDER BY p.source_id, p.slug
+      LIMIT ${EXPLICIT_FILE_LIMIT}`,
+    params,
+  );
+  return rows.map((row, index) => ({
+    slug: row.slug, source_id: row.source_id, page_id: 0, title: row.slug,
+    type: 'code', chunk_text: '', chunk_source: 'compiled_truth',
+    chunk_id: 0, chunk_index: 0, score: 1 / (1 + index), stale: false,
+    effective_date: null, effective_date_source: null,
+  } as SearchResult));
+}
+
+/** `ameba_gpio_rom.c` → `-ameba_gpio_rom-c`, the tail `slugifyCodePath`
+ *  produces for it. Used only for the slug fallback leg. */
+function codeFileMarker(fileName: string): string {
+  return `-${fileName.replace(/\./g, '-').replace(/[^A-Za-z0-9_-]+/g, '-').toLowerCase()}`;
+}
+
+/** Escape a literal for a POSIX regex so `_` and `.` stay literal. */
+function regexEscape(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Words too generic to identify a file: they match half the code index. */
+const DOMAIN_WORD_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'when', 'what',
+  'which', 'where', 'how', 'why', 'does', 'did', 'should', 'would', 'could',
+  'are', 'was', 'were', 'been', 'have', 'has', 'had', 'can', 'may', 'must',
+  'new', 'add', 'use', 'using', 'used', 'need', 'want', 'make', 'like', 'not',
+  'sdk', 'dsp', 'file', 'files', 'code', 'source', 'test', 'tests', 'example',
+  'existing', 'already', 'custom', 'some', 'any', 'all', 'one', 'two', 'more',
+]);
+
+/** Cap on pages pulled in by domain-word matching. These are candidates
+ *  (matched on a word), not the question's subject, so the cap stays small. */
+const DOMAIN_WORD_LIMIT = 6;
+
+/**
+ * Plan A of the anchorless-code-question fix: match code-style words from the
+ * question (and its LLM expansions) against the CODE INDEX, inside the
+ * caller's source scope.
+ *
+ * The gap this closes: a question that names no file and no symbol ("which
+ * existing test shows how to add a shell command that prints a counter")
+ * has no deterministic leg at all — `findPagesByFileName` needs a filename,
+ * `findIndexedCodeHelpers` needs a symbol, and the semantic leg has to bridge
+ * Chinese prose to English code vocabulary on its own. Measured on dsp:
+ * `source-verification-heap_types_test-dsp_heap_test-c` holds the exact
+ * COMMAND_TABLE the question is about and never entered the top 40.
+ *
+ * Source-scoped by construction — the same predicate shape as every other
+ * gather stream. With NO scope (whole-brain search) the leg stays off: words
+ * like `shell` exist in every imported SDK, and returning six copies of
+ * `shell_cmd.h` from four different sources is worse than returning none.
+ */
+async function findPagesByDomainWords(
+  engine: BrainEngine,
+  words: string[],
+  opts: Pick<ThinkGatherOpts, 'sourceId' | 'sourceIds'>,
+): Promise<SearchResult[]> {
+  const { sourceId, sourceIds } = resolveThinkSourceScope(opts);
+  if (!sourceId && !(sourceIds && sourceIds.length > 0)) return [];
+
+  const tokens = Array.from(new Set(
+    words
+      .flatMap((word) => word.toLowerCase().match(/[a-z][a-z0-9_]{2,}/g) ?? [])
+      .filter((token) => !DOMAIN_WORD_STOPWORDS.has(token)),
+  )).slice(0, 16);
+  if (tokens.length === 0) return [];
+
+  // Score through FULL-TEXT SEARCH over the chunk text (which carries both
+  // the path and the symbol header) rather than a hand-rolled regex count.
+  // Two measured reasons:
+  //  - `ts_rank` weights words by INVERSE document frequency, so `cmd` and
+  //    `counter` pull harder than `table`. A raw hit count handed the win to
+  //    `__renaming__.h`, which carries hundreds of `_table_` symbols.
+  //  - The OR query (`a | b | c`) needs no `(^|_)…(_|$)` alternation: FTS
+  //    stems and word-splits the same way, and matches `dsp_heap_cmd_table`
+  //    from the chunk header even when the symbol never appears in the slug.
+  // Measured on dsp with this exact question this ranks
+  // `source-verification-heap_types_test-dsp_heap_test-c` FIRST.
+  const tsQuery = tokens.map((token) => token.replace(/[^a-z0-9_]/g, '')).filter(Boolean).join(' | ');
+  if (!tsQuery) return [];
+
+  const params: unknown[] = [tsQuery];
+  let sourcePredicate = '';
+  if (sourceIds && sourceIds.length > 0) {
+    params.push(sourceIds);
+    sourcePredicate = `AND p.source_id = ANY($${params.length}::text[])`;
+  } else {
+    params.push(sourceId);
+    sourcePredicate = `AND p.source_id = $${params.length}`;
+  }
+
+  // Carry each page's BEST chunk text, not just its slug. This leg produces
+  // LOCATOR rows (page, score) but the renderer prints `chunk_text` — an
+  // empty body renders an empty page and the model correctly reports "no
+  // material", which is exactly what happened before this was added.
+  const rows = await engine.executeRaw<{
+    slug: string; source_id: string; chunk_id: number; chunk_index: number;
+    chunk_text: string; title: string | null;
+  }>(
+    // DISTINCT ON forces its own leading ORDER BY, so the rank ordering has
+    // to happen in an OUTER query — ordering inside would have let LIMIT take
+    // the alphabetically first six pages instead of the best-matching ones.
+    `SELECT slug, source_id, chunk_id, chunk_index, chunk_text, title
+       FROM (
+         SELECT DISTINCT ON (p.slug, p.source_id)
+                p.slug, p.source_id, cc.id AS chunk_id, cc.chunk_index,
+                cc.chunk_text, p.title,
+                ts_rank(cc.search_vector, to_tsquery('english', $1)) AS rank
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+          WHERE p.page_kind = 'code'
+            AND p.deleted_at IS NULL
+            AND cc.search_vector @@ to_tsquery('english', $1)
+            ${sourcePredicate}
+          ORDER BY p.slug, p.source_id, rank DESC
+       ) best
+      ORDER BY rank DESC, slug
+      LIMIT ${DOMAIN_WORD_LIMIT}`,
+    params,
+  );
+  return rows.map((row, index) => ({
+    slug: row.slug, source_id: row.source_id, page_id: 0, title: row.title ?? row.slug,
+    type: 'code', chunk_text: row.chunk_text, chunk_source: 'compiled_truth',
+    chunk_id: row.chunk_id, chunk_index: row.chunk_index,
+    score: 1 / (1 + index), stale: false,
+    effective_date: null, effective_date_source: null,
+  } as SearchResult));
+}
 
 /**
  * Resolve called-helper symbols against the CODE INDEX rather than against
@@ -88,6 +280,32 @@ async function findIndexedCodeHelpers(
       LIMIT ${INDEXED_HELPER_LIMIT}`,
     params,
   );
+}
+
+/** True when the caller's source scope holds indexed CODE. Drives which
+ *  expansion prompt think sends (code vocabulary vs prose rewrites), and is
+ *  deliberately an EXISTS probe — one row, not a count. */
+async function scopeHasCodePages(
+  engine: BrainEngine,
+  scope: { sourceId?: string; sourceIds?: string[] },
+): Promise<boolean> {
+  if (!scope.sourceId && !(scope.sourceIds && scope.sourceIds.length > 0)) return false;
+  const params: unknown[] = [];
+  let predicate = '';
+  if (scope.sourceIds && scope.sourceIds.length > 0) {
+    params.push(scope.sourceIds);
+    predicate = `AND source_id = ANY($1::text[])`;
+  } else {
+    params.push(scope.sourceId);
+    predicate = `AND source_id = $1`;
+  }
+  const rows = await engine.executeRaw<{ one: number }>(
+    `SELECT 1 AS one FROM pages
+      WHERE page_kind = 'code' AND deleted_at IS NULL ${predicate}
+      LIMIT 1`,
+    params,
+  );
+  return rows.length > 0;
 }
 
 export interface ThinkGatherOpts {
@@ -272,6 +490,39 @@ export async function runGather(
   // this, and detectCodeFocus does regex work over the question.
   const codeFocus = detectCodeFocus(opts.question);
 
+  // The LLM rewrite of the question, computed ONCE and shared by the two legs
+  // that need it: hybrid's multi-query arm (Plan B) and the slug-word match
+  // below (Plan A). Two independent calls would double the expansion spend
+  // and could disagree about the vocabulary; one call, two consumers.
+  //
+  // Only the EXPANSIONS are used here, never the original — a slug match on
+  // the original's words would fire on any question that happens to contain
+  // "test", which is most code questions. Failure yields no expansions and
+  // both legs degrade to their previous behavior.
+  const expansionsPromise: Promise<string[]> = (async () => {
+    try {
+      // Code sources get CODE-vocabulary rewrites: the generic prompt returns
+      // prose restatements of a Chinese question, which the semantic arm
+      // already has. Prose sources keep the generic prompt.
+      const codeScoped = await scopeHasCodePages(engine, sourceScope).catch(() => false);
+      return await (codeScoped ? expandQueryForCode(retrievalQuestion) : expandQuery(retrievalQuestion));
+    } catch {
+      return [retrievalQuestion];
+    }
+  })();
+  /** `expandFn` for hybrid, backed by the shared promise. The contract
+   *  requires the caller's query as entry 0; `expandQuery` already honors it. */
+  const sharedExpandFn = () => expansionsPromise;
+
+  // Symbol anchors for the structural pass. A question that NAMES an
+  // identifier ("why does idma_copy_desc take DESC_NOTIFY_W_INT") is an
+  // identity lookup, and embeddings answer it badly: the chunk holding that
+  // call is three lines long and scores below every prose page explaining the
+  // API. `hybridSearch` already has the anchor machinery (two-pass.ts, an
+  // exact `symbol_name_qualified` probe); think simply never passed it any.
+  // For C the qualified name IS the bare function name, so the probe lands.
+  const symbolAnchors = codeFocus.symbols;
+
   const warnings: string[] = [];
   const window = opts.window;
 
@@ -294,9 +545,19 @@ export async function runGather(
   const pagesPromise = (window ? Promise.all([
     hybridSearch(engine, retrievalQuestion, {
       limit: Math.min(gatherLimit * 4, 200),
-      expansion: false,
+      // Multi-query expansion, opt-in per call. A prose question naming no
+      // identifier ("which existing test should I model a new shell command
+      // on") sits too far from the code vocabulary to reach it by semantics
+      // alone — measured: `dsp_heap_cmd_table`, the exact table that answers
+      // it, never entered the top 40. The LLM rewrite bridges that gap
+      // ("print a counter" -> "heap dump statistics"). Retrieval SCOPE is
+      // untouched: sourceScope still bounds every arm to the caller's
+      // source(s), so expansion cannot leak across SDKs.
+      expansion: true,
+      expandFn: sharedExpandFn,
       ...INTERNAL_BREADTH_SEARCH_OPTS,
       ...pageScope,
+      ...(symbolAnchors.length > 0 ? { nearSymbols: symbolAnchors } : {}),
       decide,
     }),
     engine.listPages({
@@ -316,9 +577,11 @@ export async function runGather(
     return filtered.kept.slice(0, gatherLimit);
   }) : hybridSearch(engine, retrievalQuestion, {
     limit: gatherLimit,
-    expansion: false,
+    expansion: true,
+    expandFn: sharedExpandFn,
     ...INTERNAL_BREADTH_SEARCH_OPTS,
     ...pageScope,
+    ...(symbolAnchors.length > 0 ? { nearSymbols: symbolAnchors } : {}),
     decide,
   })).catch((e) => {
     warnings.push('GATHER_HYBRID_FAILED');
@@ -402,16 +665,46 @@ export async function runGather(
       })
     : Promise.resolve(null);
 
-  const [hybridPages, takesKw, takesVec, graphSlugs, anchorPage, prefixPages] = await Promise.all([
-    pagesPromise, takesKwPromise, takesVecPromise, graphPromise, anchorPagePromise, prefixPagesPromise,
+  // Stream 5: explicitly named files, resolved by path rather than by rank.
+  // Runs even when nothing named a file (empty promise) so the fan-in stays a
+  // single list; the lookup itself short-circuits on an empty name list.
+  const explicitFilePromise: Promise<SearchResult[]> = codeFocus.files.length > 0
+    ? findPagesByFileName(engine, codeFocus.files, opts).catch((e) => {
+        warnings.push('GATHER_EXPLICIT_FILE_FAILED');
+        process.stderr.write(`[think.gather] explicit-file stream failed: ${(e as Error).message}\n`);
+        return [] as SearchResult[];
+      })
+    : Promise.resolve([] as SearchResult[]);
+
+  // Stream 6: slug words from the LLM's rewrites (Plan A). Awaits the shared
+  // expansion promise, so it costs nothing when Plan B already ran. Empty
+  // when there is no source scope — see findPagesByDomainWords.
+  const domainWordPromise: Promise<SearchResult[]> = expansionsPromise
+    .then((expansions) => findPagesByDomainWords(
+      engine,
+      expansions.filter((q) => q !== retrievalQuestion),
+      opts,
+    ))
+    .catch((e) => {
+      warnings.push('GATHER_DOMAIN_WORD_FAILED');
+      process.stderr.write(`[think.gather] domain-word stream failed: ${(e as Error).message}\n`);
+      return [] as SearchResult[];
+    });
+
+  const [hybridPages, takesKw, takesVec, graphSlugs, anchorPage, prefixPages, explicitFilePages, domainWordPages] = await Promise.all([
+    pagesPromise, takesKwPromise, takesVecPromise, graphPromise, anchorPagePromise, prefixPagesPromise, explicitFilePromise, domainWordPromise,
   ]);
 
   // Diagnostics honesty: count hybrid's own hits BEFORE any merge, so a
   // directory listing can never be reported as retrieval quality.
   const pagesFromHybrid = hybridPages.length;
-  const pages: SearchResult[] = prefixPages.length === 0
+  // A named file ranks AHEAD of everything hybrid produced: it is the
+  // question's own subject, not a candidate. Same merge shape as prefix
+  // enumeration (dedup by source+slug, deterministic list first).
+  const named = [...explicitFilePages, ...domainWordPages, ...prefixPages];
+  const pages: SearchResult[] = named.length === 0
     ? hybridPages
-    : [...prefixPages, ...hybridPages.filter((p) => !prefixPages.some(k => k.source_id === p.source_id && k.slug === p.slug))];
+    : [...named, ...hybridPages.filter((p) => !named.some(k => k.source_id === p.source_id && k.slug === p.slug))];
 
   // Action-wrapped exact titles score poorly in semantic retrieval ("总结一下
   // X" against a page titled X). Recover deterministically through the existing

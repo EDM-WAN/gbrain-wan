@@ -34,6 +34,8 @@ export interface TwoPassOpts {
   walkDepth?: number;
   /** When set, find chunks whose symbol_name_qualified matches; add to anchor set. */
   nearSymbol?: string;
+  /** Several symbol anchors at once. Unioned with `nearSymbol`. */
+  nearSymbols?: string[];
   /** Filter expansion to one source. When unset, crosses sources. */
   sourceId?: string;
 }
@@ -43,6 +45,18 @@ interface ChunkWithScore {
   score: number;
   hop: number;
   source: 'anchor' | 'neighbor';
+}
+
+/** Union of the single and plural anchor options, deduped, empties dropped.
+ *  Capped so a pathological question ("why does a call b call c call …") can
+ *  never turn one retrieval into an unbounded IN list. */
+const MAX_NEAR_SYMBOLS = 12;
+
+function normalizedNearSymbols(opts: TwoPassOpts): string[] {
+  const all = [opts.nearSymbol ?? '', ...(opts.nearSymbols ?? [])]
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return Array.from(new Set(all)).slice(0, MAX_NEAR_SYMBOLS);
 }
 
 /**
@@ -56,7 +70,8 @@ export async function expandAnchors(
   opts: TwoPassOpts = {},
 ): Promise<ChunkWithScore[]> {
   const depth = Math.min(Math.max(opts.walkDepth ?? 0, 0), MAX_WALK_DEPTH);
-  if (depth === 0 && !opts.nearSymbol) {
+  const nearSymbols = normalizedNearSymbols(opts);
+  if (depth === 0 && nearSymbols.length === 0) {
     return anchors.map(a => ({
       chunk_id: a.chunk_id,
       score: a.score,
@@ -83,19 +98,24 @@ export async function expandAnchors(
   // TwoPassOpts.sourceId field being declared — multi-source brains
   // cross-contaminated structural retrieval. Now: opts.sourceId set →
   // filter; undefined → cross-source (matches the documented contract).
-  if (opts.nearSymbol) {
+  if (nearSymbols.length > 0) {
     try {
+      // One query for every anchor: a question naming two functions used to
+      // need a serial pipeline per symbol. `= ANY` keeps it a single index
+      // probe, and the LIMIT is per-SYMBOL (50) times the anchor count so a
+      // common name cannot crowd out the others.
+      const cap = 50 * nearSymbols.length;
       const rows = opts.sourceId
         ? await engine.executeRaw<{ id: number }>(
             `SELECT cc.id FROM content_chunks cc
              JOIN pages p ON p.id = cc.page_id
-             WHERE cc.symbol_name_qualified = $1 AND p.source_id = $2
-             LIMIT 50`,
-            [opts.nearSymbol, opts.sourceId],
+             WHERE cc.symbol_name_qualified = ANY($1::text[]) AND p.source_id = $2
+             LIMIT $3`,
+            [nearSymbols, opts.sourceId, cap],
           )
         : await engine.executeRaw<{ id: number }>(
-            `SELECT id FROM content_chunks WHERE symbol_name_qualified = $1 LIMIT 50`,
-            [opts.nearSymbol],
+            `SELECT id FROM content_chunks WHERE symbol_name_qualified = ANY($1::text[]) LIMIT $2`,
+            [nearSymbols, cap],
           );
       const baseScore = anchors.length > 0 ? anchors[0]!.score : 1.0;
       for (const r of rows) {

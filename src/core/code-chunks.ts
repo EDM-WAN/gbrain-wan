@@ -6,8 +6,30 @@ import { sanitizeRemoteBody } from './remote-body.ts';
 import { credentialSafeProjection } from './credential-projection.ts';
 import { isEmbedSkipped } from './embed-skip.ts';
 import { isQuarantined } from './quarantine.ts';
+import { getEmbeddingDimensions } from './embedding.ts';
+import { getEmbeddingModel } from './ai/gateway.ts';
 
-export async function prepareCodeChunks(page: { compiled_truth: string; frontmatter?: Record<string, unknown> | null }, path: string) {
+/**
+ * Chunk a code page and fill whatever vectors the cross-source cache already
+ * holds.
+ *
+ * This is the ONE place both code paths converge — `importCodeFile` and the
+ * coordinated `reindex-code` projection both call it — so a cache lookup here
+ * covers a re-import and a chunker-version re-chunk alike. Without it, a
+ * `CHUNKER_VERSION` bump re-embeds every source even when the chunk text is
+ * byte-identical (measured: 36861 dsp chunks behind 255202 cached rows, 0 hits).
+ *
+ * A hit here is always correct by construction: the cache is keyed on the exact
+ * text sent to the provider, plus the model and the width the provider actually
+ * emits. Width comes from the provider, never from the column descriptor —
+ * `normalizeEngineColumn` reports a hardcoded 1536 placeholder for the default
+ * `embedding` column, which silently keys every lookup wrong on a 2560-d brain.
+ *
+ * Best-effort: any failure leaves the vectors absent and the caller's normal
+ * embed path (or a later `embed --stale`) fills them.
+ */
+export async function prepareCodeChunks(page: { compiled_truth: string; frontmatter?: Record<string, unknown> | null }, path: string,
+  opts: { engine?: BrainEngine } = {}) {
   const content = credentialSafeProjection(sanitizeRemoteBody(page.compiled_truth));
   const prepared = isEmbedSkipped(page.frontmatter) || isQuarantined(page.frontmatter)
     ? { chunks: [], edges: [] } : await chunkCodeTextFull(content, path);
@@ -18,7 +40,27 @@ export async function prepareCodeChunks(page: { compiled_truth: string; frontmat
     parent_symbol_path: c.metadata.parentSymbolPath?.length ? c.metadata.parentSymbolPath : undefined,
     symbol_name_qualified: c.metadata.symbolNameQualified || undefined,
   }));
+  if (opts.engine && chunks.length > 0) await fillFromEmbeddingCache(opts.engine, chunks);
   return { chunks, edges: prepared.edges, content };
+}
+
+/** Copy cached vectors onto `chunks`, in place. Silently no-ops on any error. */
+async function fillFromEmbeddingCache(engine: BrainEngine, chunks: ChunkInput[]): Promise<void> {
+  try {
+    const model = getEmbeddingModel();
+    const dimensions = getEmbeddingDimensions();
+    if (!model || !Number.isFinite(dimensions) || dimensions <= 0) return;
+    const { lookupEmbeddings } = await import('./embedding-cache.ts');
+    const result = await lookupEmbeddings(engine, { model, dimensions, input: '' },
+      chunks.map((c) => c.chunk_text));
+    for (const hit of result.hits) {
+      const chunk = chunks[hit.index];
+      if (!chunk) continue;
+      chunk.embedding = hit.embedding;
+      if (hit.token_count != null) chunk.token_count = hit.token_count;
+      chunk.model = model;
+    }
+  } catch { /* cache is an optimization; never fail a projection */ }
 }
 
 export async function installCodeChunkEdges(engine: BrainEngine, slug: string, sourceId: string,
